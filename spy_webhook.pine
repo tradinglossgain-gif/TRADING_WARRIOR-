@@ -1,0 +1,86 @@
+//@version=6
+indicator("SPY webhook — CALL / PUT signal recorder", overlay=true, max_labels_count=200)
+
+token = input.string("", "Webhook token (keep private)")
+entryWindow = input.session("0945-1530", "Entry window — New York")
+rewardRisk = input.float(2.0, "Reward / risk", minval=0.1)
+atrMultiple = input.float(1.0, "Minimum stop ATR", minval=0.1)
+flowThreshold = input.float(0.15, "Volume pressure threshold", minval=0, maxval=1)
+relativeVolume = input.float(1.2, "Relative volume threshold", minval=0.1)
+cooldown = input.int(3, "Cooldown bars", minval=1)
+
+if not timeframe.isintraday or syminfo.ticker != "SPY"
+    runtime.error("Use an intraday SPY chart, preferably 5 minutes.")
+
+fast = ta.ema(close, 9)
+slow = ta.ema(close, 21)
+vwapValue = ta.vwap(hlc3)
+atrValue = ta.atr(14)
+priorHigh = ta.highest(high, 5)[1]
+priorLow = ta.lowest(low, 5)[1]
+swingLow = ta.lowest(low, 5)
+swingHigh = ta.highest(high, 5)
+spread = math.max(high - low, syminfo.mintick)
+pressure = ((close - low) - (high - close)) / spread
+averageVolume = ta.sma(volume, 10)
+flow = averageVolume > 0 ? ta.sma(pressure * volume, 10) / averageVolume : na
+rvol = averageVolume > 0 ? volume / averageVolume : na
+strongBody = math.abs(close - open) / spread >= 0.5
+inWindow = not na(time(timeframe.period, entryWindow, "America/New_York"))
+regular = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+bull = inWindow and close > vwapValue and fast > slow and close > priorHigh and close > open and strongBody and flow > flowThreshold and rvol >= relativeVolume
+bear = inWindow and close < vwapValue and fast < slow and close < priorLow and close < open and strongBody and flow < -flowThreshold and rvol >= relativeVolume
+
+// No broker credentials belong in Pine. The token authenticates this receiver only.
+jsonEscape(string value) =>
+    str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\"")
+
+payload(string id, string action, int side, float entry, float stop, float target) =>
+    stamp = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    "{\"token\":\"" + jsonEscape(token) + "\",\"trade_id\":\"" + id + "\",\"action\":\"" + action + "\",\"timestamp\":\"" + stamp + "\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(stop, format.mintick) + ",\"target\":" + str.tostring(target, format.mintick) + "}"
+
+var int direction = 0
+var int entryBar = na
+var int lastSignal = na
+var float entry = na
+var float stop = na
+var float target = na
+var string tradeId = ""
+var bool entryNotified = false
+bool closedNow = false
+
+if barstate.isconfirmed
+    if direction != 0 and bar_index > entryBar
+        hitStop = direction == 1 ? low <= stop : high >= stop
+        hitTarget = not hitStop and (direction == 1 ? high >= target : low <= target)
+        expired = not regular
+        if hitStop or hitTarget or expired
+            action = hitStop ? "EXIT_SL" : hitTarget ? "EXIT_TP" : "EXPIRE"
+            if barstate.isrealtime and entryNotified
+                alert(payload(tradeId, action, direction, entry, stop, target), alert.freq_once_per_bar_close)
+            label.new(bar_index, close, action, color=color.gray, textcolor=color.white)
+            direction := 0
+            closedNow := true
+            entryNotified := false
+
+    eligible = direction == 0 and not closedNow and (na(lastSignal) or bar_index - lastSignal >= cooldown)
+    if eligible and (bull or bear) and not na(atrValue)
+        direction := bull ? 1 : -1
+        entry := math.round_to_mintick(close)
+        stop := math.round_to_mintick(direction == 1 ? math.min(swingLow - syminfo.mintick, entry - atrValue * atrMultiple) : math.max(swingHigh + syminfo.mintick, entry + atrValue * atrMultiple))
+        target := math.round_to_mintick(entry + direction * math.abs(entry - stop) * rewardRisk)
+        entryBar := bar_index
+        lastSignal := bar_index
+        tradeId := "SPY-" + timeframe.period + "-" + str.tostring(time)
+        entryNotified := barstate.isrealtime and str.length(token) >= 32
+        if entryNotified
+            alert(payload(tradeId, "ENTRY", direction, entry, stop, target), alert.freq_once_per_bar_close)
+        text = (direction == 1 ? "CALL" : "PUT") + "\nEntry " + str.tostring(entry, format.mintick) + "\nSL " + str.tostring(stop, format.mintick) + "\nTP " + str.tostring(target, format.mintick)
+        label.new(bar_index, direction == 1 ? low : high, text, style=direction == 1 ? label.style_label_up : label.style_label_down, color=direction == 1 ? color.green : color.red, textcolor=color.white)
+
+plot(vwapValue, "VWAP", color=color.orange)
+plot(fast, "EMA 9", color=color.aqua)
+plot(slow, "EMA 21", color=color.blue)
+plot(direction != 0 or closedNow ? entry : na, "Entry (SPY)", color=color.white, style=plot.style_linebr)
+plot(direction != 0 or closedNow ? stop : na, "SL (SPY)", color=color.red, style=plot.style_linebr)
+plot(direction != 0 or closedNow ? target : na, "TP (SPY)", color=color.lime, style=plot.style_linebr)

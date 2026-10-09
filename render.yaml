@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: spy-paper-webhook
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:application --factory --host 0.0.0.0 --port $PORT --workers 1 --no-access-log
+    healthCheckPath: /health
+    disk:
+      name: webhook-events
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: WEBHOOK_TOKEN
+        generateValue: true
+      - key: DATABASE_PATH
+        value: /var/data/events.sqlite3
+      - key: KILL_SWITCH_FILE
+        value: /var/data/PAUSED
