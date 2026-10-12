@@ -1,0 +1,1949 @@
+//@version=6
+indicator("SPY OPTIONS FULL v22 — Liquidity Targets + Entry Diagnostics", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+// COMPLETE INDICATOR: EMA 10/15/22, Hull, VWAP, momentum dashboard,
+// intermediate liquidity, sweep/reclaim/displacement/retest entries,
+// CALL/PUT markers, entry/SL/TP frames, trailing exits and estimated volume cells.
+// Frames appear only for a qualified tracked setup. No profitability claim.
+// Sandbox token is supplied privately in Inputs. Alerts default OFF.
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+groupResponse = "00 — TRADE RESPONSE"
+enteredResponse = input.string("WAITING", "1. DID YOU ENTER?", options=["WAITING", "YES", "NO"], group=groupResponse)
+manualExitResponse = input.string("WAITING", "2. DID YOU EXIT MANUALLY?", options=["WAITING", "YES"], group=groupResponse)
+manualExitPrice = input.float(0.0, "3. MANUAL EXIT SPY PRICE", minval=0.0, step=0.01, group=groupResponse)
+
+groupSignal = "01 — SIGNAL ENGINE"
+minimumScore = input.int(72, "Minimum Direction Score", minval=50, maxval=95, group=groupSignal)
+minimumEdge = input.int(15, "Minimum Direction Edge", minval=5, maxval=40, group=groupSignal)
+structureLength = input.int(6, "Structure Lookback", minval=2, maxval=30, group=groupSignal)
+cooldownBars = input.int(3, "Cooldown Bars", minval=0, maxval=30, group=groupSignal)
+autoTrackSignals = input.bool(true, "Automatically Track Entry Signals", tooltip="Tracks indicator signals without placing orders. Manual YES/NO and manual-exit responses are ignored while enabled.", group=groupSignal)
+enableMovementReentry = input.bool(true, "Enable Movement-Based Re-entry", group=groupSignal)
+reentryMoveATR = input.float(0.75, "Fresh Directional Movement (ATR)", minval=0.1, step=0.05, group=groupSignal)
+reentryResetATR = input.float(0.50, "Pullback To Rearm (ATR)", minval=0.1, step=0.05, group=groupSignal)
+cancelStalePending = input.bool(true, "Cancel Pending Setup When Market Changes", group=groupSignal)
+pendingExpiryBars = input.int(6, "Pending Setup Expiration Bars", minval=1, maxval=30, group=groupSignal)
+retainEntryBoxes = input.bool(true, "Retain Completed Entry Boxes", group=groupSignal)
+retainedEntries = input.int(30, "Entry Boxes To Retain", minval=1, maxval=30, group=groupSignal)
+showCenterSummary = input.bool(true, "Show Center Entry / TP / SL / R:R Label", group=groupSignal)
+
+groupTrend = "02 — TREND ENGINE"
+emaFastLength = input.int(10, "Fast EMA", minval=1, group=groupTrend)
+emaSlowLength = input.int(15, "Slow EMA", minval=2, group=groupTrend)
+emaTrendLength = input.int(22, "Trend EMA", minval=10, group=groupTrend)
+hullLength = input.int(21, "Hull MA Length", minval=5, group=groupTrend)
+mediumTF = input.timeframe("15", "Medium Timeframe", group=groupTrend)
+majorTF = input.timeframe("60", "Major Timeframe", group=groupTrend)
+
+groupMomentum = "03 — MOMENTUM"
+rsiLength = input.int(14, "RSI Length", minval=2, group=groupMomentum)
+macdFastLength = input.int(12, "MACD Fast", minval=1, group=groupMomentum)
+macdSlowLength = input.int(26, "MACD Slow", minval=2, group=groupMomentum)
+macdSignalLength = input.int(9, "MACD Signal", minval=1, group=groupMomentum)
+adxLength = input.int(14, "ADX Length", minval=2, group=groupMomentum)
+adxSmoothing = input.int(14, "ADX Smoothing", minval=2, group=groupMomentum)
+minimumADX = input.float(18.0, "Preferred ADX", minval=5.0, step=1.0, group=groupMomentum)
+
+groupVolume = "04 — VOLUME / VOLATILITY"
+volumeLength = input.int(20, "RVOL Length", minval=5, group=groupVolume)
+preferredRVOL = input.float(1.00, "Preferred RVOL", minval=0.1, step=0.05, group=groupVolume)
+strongRVOLLevel = input.float(1.30, "Strong RVOL", minval=0.2, step=0.05, group=groupVolume)
+atrLength = input.int(14, "ATR Length", minval=2, group=groupVolume)
+atrAverageLength = input.int(20, "ATR Average Length", minval=5, group=groupVolume)
+
+groupSession = "05 — SESSION"
+tradeSession = input.session("0945-1400", "SPY Entry Window", group=groupSession)
+hardExitHour = input.int(14, "Hard Exit Hour ET", minval=0, maxval=23, group=groupSession)
+hardExitMinute = input.int(0, "Hard Exit Minute ET", minval=0, maxval=59, group=groupSession)
+avoidLunch = input.bool(true, "Avoid 12:00–13:30 ET", group=groupSession)
+
+groupRisk = "06 — RISK / REWARD"
+baseRR = input.float(1.25, "Base Risk / Reward", minval=0.75, maxval=3.0, step=0.25, group=groupRisk)
+boxBars = input.int(15, "Position Box Width", minval=5, maxval=50, group=groupRisk)
+labelOffsetBars = input.int(4, "Trade Label Offset Right", minval=1, maxval=30, group=groupRisk)
+enableTrailStop = input.bool(true, "Enable Trailing Stop", group=groupRisk)
+trailMethod = input.string("ATR", "Trailing Stop Method", options=["ATR", "Percent", "Points"], group=groupRisk)
+trailActivationR = input.float(0.80, "Normal Trail Activation (R)", minval=0.25, maxval=3.00, step=0.05, group=groupRisk)
+trailATRMultiplier = input.float(0.90, "Normal Trail Distance — ATR", minval=0.10, maxval=3.00, step=0.05, group=groupRisk)
+strongTrailActivationR = input.float(1.25, "Strong Trend Trail Activation (R)", minval=0.50, maxval=4.00, step=0.05, group=groupRisk)
+strongTrailATRMultiplier = input.float(1.35, "Strong Trend Trail Distance — ATR", minval=0.25, maxval=5.00, step=0.05, group=groupRisk)
+veryStrongTrailActivationR = input.float(1.50, "Very Strong Trend Trail Activation (R)", minval=0.50, maxval=5.00, step=0.05, group=groupRisk)
+veryStrongTrailATRMultiplier = input.float(1.60, "Very Strong Trend Trail Distance — ATR", minval=0.25, maxval=6.00, step=0.05, group=groupRisk)
+runnerEMAATRBuffer = input.float(0.20, "Runner EMA15 Buffer × ATR", minval=0.00, maxval=2.00, step=0.05, group=groupRisk)
+runnerStructureLookback = input.int(4, "Runner Structure Lookback", minval=2, maxval=20, group=groupRisk)
+runnerStructureATRBuffer = input.float(0.10, "Runner Structure Buffer × ATR", minval=0.00, maxval=2.00, step=0.05, group=groupRisk)
+trailPercent = input.float(0.25, "Trail Distance — Percent", minval=0.05, maxval=10.00, step=0.05, group=groupRisk)
+trailPoints = input.float(0.75, "Trail Distance — Points", minval=0.05, step=0.05, group=groupRisk)
+trailBandATRWidth = input.float(0.12, "Trail Band Half-Width × ATR", minval=0.01, maxval=1.00, step=0.01, group=groupRisk)
+showTrailBand = input.bool(true, "Show Trail Stop Loss Band", group=groupRisk)
+enableBreakeven = input.bool(true, "Enable Breakeven Protection", group=groupRisk)
+breakevenActivationR = input.float(0.80, "Move SL To Breakeven At R", minval=0.25, maxval=3.00, step=0.05, group=groupRisk)
+enableProfitLock = input.bool(true, "Enable Profit Lock", group=groupRisk)
+profitLockActivationR = input.float(1.20, "Lock Profit At R", minval=0.50, maxval=4.00, step=0.05, group=groupRisk)
+profitLockR = input.float(0.25, "Minimum Profit Locked In R", minval=0.00, maxval=2.00, step=0.05, group=groupRisk)
+
+groupOptions = "07 — OPTIONS CONTRACT"
+strikeIncrement = input.float(1.0, "Strike Increment", minval=0.5, step=0.5, group=groupOptions)
+itmDepth = input.int(1, "ITM Depth — Number Of Strikes", minval=1, maxval=10, group=groupOptions)
+expirationText = input.string("0DTE", "Suggested Expiration", options=["0DTE", "1DTE", "2DTE"], group=groupOptions)
+useStrictOptionPremiumExits = input.bool(false, "Use Strict Option Premium Exits", group=groupOptions)
+callOptionSymbol = input.symbol("AMEX:SPY", "CALL Option Symbol", tooltip="Select the exact CALL option contract before enabling premium exits.", group=groupOptions)
+putOptionSymbol = input.symbol("AMEX:SPY", "PUT Option Symbol", tooltip="Select the exact PUT option contract before enabling premium exits.", group=groupOptions)
+optionContracts = input.int(1, "Contracts", minval=1, maxval=100, group=groupOptions)
+optionStopPct = input.float(12.0, "Option Premium Stop %", minval=1.0, maxval=80.0, step=0.5, group=groupOptions)
+optionTargetPct = input.float(18.0, "Option Premium Target %", minval=1.0, maxval=200.0, step=0.5, group=groupOptions)
+useOptionDollarRiskCap = input.bool(true, "Premium-mode Loss Threshold (Not Broker Protection)", group=groupOptions)
+maxOptionLossDollars = input.float(250.0, "Max Loss Per Trade ($)", minval=25.0, maxval=10000.0, step=25.0, group=groupOptions)
+useOptionDollarTargetCap = input.bool(false, "Use Dollar Profit Target", group=groupOptions)
+optionProfitTargetDollars = input.float(350.0, "Profit Target Per Trade ($)", minval=25.0, maxval=20000.0, step=25.0, group=groupOptions)
+optionUsePremiumTrail = input.bool(true, "Trail Option Premium After Target %", group=groupOptions)
+optionTrailGivebackPct = input.float(8.0, "Option Premium Trail Giveback %", minval=1.0, maxval=50.0, step=0.5, group=groupOptions)
+
+groupExit = "08 — EXIT ENGINE"
+enableReversalExit = input.bool(true, "Enable Reversal Exit", group=groupExit)
+reversalScore = input.int(72, "Opposite Score Required", minval=50, maxval=95, group=groupExit)
+reversalEdge = input.int(12, "Opposite Edge Required", minval=5, maxval=30, group=groupExit)
+enableMomentumExit = input.bool(true, "Enable Momentum Exit", group=groupExit)
+momentumExitScore = input.int(65, "Momentum Exit — Direction Score Below", minval=40, maxval=90, group=groupExit)
+momentumExitEdge = input.int(10, "Momentum Exit — Direction Edge Below", minval=0, maxval=30, group=groupExit)
+
+groupDisplay = "09 — DISPLAY"
+showEMA = input.bool(true, "Show EMA 10 / 15 / 22", group=groupDisplay)
+showHull = input.bool(true, "Show Hull", group=groupDisplay)
+showVWAP = input.bool(true, "Show VWAP", group=groupDisplay)
+showDashboard = input.bool(true, "Show Dashboard", group=groupDisplay)
+
+groupOrderflow = "10 — ESTIMATED VOLUME DISPLAY (NOT ORDER FLOW)"
+showOrderflow = input.bool(true, "Show Estimated Volume Matrix", group=groupOrderflow)
+orderflowLiveTracking = input.bool(true, "Live Track Current Candle", group=groupOrderflow)
+orderflowBarsToShow = input.int(6, "Recent Candles To Show", minval=3, maxval=30, group=groupOrderflow)
+orderflowRows = input.int(6, "Rows Per Candle", minval=4, maxval=14, group=groupOrderflow)
+orderflowWidthPct = input.float(46.0, "Block Width (% of candle spacing)", minval=15.0, maxval=48.0, step=1.0, group=groupOrderflow)
+orderflowGapPct = input.float(1.0, "Center Gap (% of candle spacing)", minval=0.0, maxval=15.0, step=1.0, group=groupOrderflow)
+orderflowDominanceBoost = input.float(0.20, "Directional Bias", minval=0.0, maxval=0.50, step=0.05, group=groupOrderflow)
+orderflowShowNumbers = input.bool(true, "Show Row Volume Numbers", group=groupOrderflow)
+orderflowShowDelta = input.bool(true, "Show Candle Delta", group=groupOrderflow)
+orderflowHighlightDominant = input.bool(true, "Highlight Dominant Rows", group=groupOrderflow)
+orderflowDominanceRatio = input.float(1.55, "Dominance Ratio", minval=1.10, maxval=5.00, step=0.10, group=groupOrderflow)
+orderflowPhotoStyle = input.bool(true, "Photo-Style Solid Blocks", group=groupOrderflow)
+orderflowBlackDominance = input.bool(false, "Black Dominant Cells", group=groupOrderflow)
+orderflowDirectionalOnly = input.bool(false, "Emphasize Dominant Side", group=groupOrderflow)
+orderflowShowDirectionTag = input.bool(true, "Show BUY / SELL Tag", group=groupOrderflow)
+orderflowStrongThreshold = input.float(0.60, "Strong Side Threshold", minval=0.52, maxval=0.85, step=0.01, group=groupOrderflow)
+orderflowClassicTapeStyle = input.bool(true, "Classic Red/Green Tape Style", group=groupOrderflow)
+orderflowTextSize = input.string("Small", "Orderflow Number Size", options=["Tiny", "Small"], group=groupOrderflow)
+orderflowShowCandleCenter = input.bool(true, "Keep Candle Visible In Center", group=groupOrderflow)
+
+//=============================================================================
+// TODAY / SESSION
+//=============================================================================
+
+groupStrategies = "11 — STRATEGY / PROFIT SIGNALS"
+strategyMode = input.string("AMD Sweep + Retest", "Entry filter (all modes require AMD sweep)", options=["AMD Sweep + Retest", "Combined", "EMA Pullback", "VWAP Reclaim", "Opening Range", "4HR Trap", "Original Score"], group=groupStrategies)
+maxEntryStretch = input.float(1.5, "Maximum Distance From EMA15 (ATR)", minval=0.25, step=0.25, group=groupStrategies)
+maxStopATR = input.float(2.5, "Reject Initial Risk Above ATR Multiple", minval=0.5, step=0.25, group=groupStrategies)
+maxDailySignals = input.int(3, "Maximum Entry Signals Per Day", minval=1, group=groupStrategies)
+useScoreGate = input.bool(false, "Also Require Original Score Threshold", group=groupStrategies)
+showHistory = input.bool(true, "Allow Historical Signals", group=groupStrategies)
+tp1R = input.float(1.0, "TP1 Profit-Taking Alert (R)", minval=0.25, step=0.25, group=groupStrategies)
+finalTargetR = input.float(2.0, "Final Target (R)", minval=0.5, step=0.25, group=groupStrategies)
+allowTargetRunner = input.bool(false, "Allow Strong Runner To Continue Beyond Final TP", group=groupStrategies)
+showOpeningRange = input.bool(true, "Show 9:30–9:45 Opening Range", group=groupStrategies)
+
+// Intermediate-pivot mapping adapts the AMD Liquidity Sweep source supplied by the user.
+groupAMD = "12 — AMD LIQUIDITY SWEEP / RECLAIM"
+amdPivotBars = input.int(1, "AMD pivot left/right bars (+1 closed-bar lag)", minval=1, maxval=10, group=groupAMD)
+amdPremarketFilter = input.bool(false, "Use intermediate swings outside 04:00–09:30 ET range", group=groupAMD)
+amdLevelAge = input.int(100, "Maximum confirmed-level age (bars)", minval=10, maxval=500, group=groupAMD)
+amdBreakExpiry = input.int(5, "Displacement must follow sweep within bars", minval=1, maxval=15, group=groupAMD)
+amdRetestExpiry = input.int(5, "Retest must follow displacement within bars", minval=1, maxval=15, group=groupAMD)
+amdDisplacementATR = input.float(0.60, "Minimum displacement body (ATR)", minval=0.10, step=0.05, group=groupAMD)
+amdMaxDisplacementATR = input.float(2.0, "Maximum displacement range (ATR)", minval=0.5, step=0.25, group=groupAMD)
+amdDisplacementRVOL = input.float(1.2, "Minimum displacement relative volume", minval=0.1, step=0.1, group=groupAMD)
+amdRetestTolerance = input.float(0.15, "Retest tolerance around broken structure (ATR)", minval=0.05, step=0.05, group=groupAMD)
+amdWickBuffer = input.float(0.10, "Frozen stop buffer beyond sweep wick (ATR)", minval=0.05, step=0.05, group=groupAMD)
+amdRequireRoom = input.bool(true, "Require target room to opposing intermediate liquidity", group=groupAMD)
+amdPivotFallback = input.bool(true, "Use confirmed-pivot / opening-range fallbacks", group=groupAMD)
+amdMinimumRR = input.float(1.25, "Minimum target reward/risk", minval=1.0, maxval=3.0, step=0.25, group=groupAMD)
+amdMaximumRR = input.float(3.0, "Maximum target reward/risk", minval=1.25, maxval=6.0, step=0.25, group=groupAMD)
+amdMinimumStopATR = input.float(0.50, "Minimum stop distance (sweep ATR)", minval=0.10, step=0.10, group=groupAMD)
+amdTargetBufferATR = input.float(0.05, "Target before opposing liquidity (ATR)", minval=0.0, step=0.05, group=groupAMD)
+amdShowLevels = input.bool(true, "Show confirmed intermediate liquidity", group=groupAMD)
+amdShowStages = input.bool(true, "Show sweep-stage markers", group=groupAMD)
+
+// Paper endpoint requires JSON; never include Webull credentials in Pine.
+groupWebhook = "13 — WEBULL SANDBOX JSON (OFF BY DEFAULT)"
+enableSandboxWebhook = input.bool(false, "Enable sandbox JSON alerts", group=groupWebhook)
+webhookToken = input.string("", "Private receiver WEBHOOK_TOKEN", group=groupWebhook)
+f_json_escape(string value) =>
+    str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\"")
+f_sandbox_payload(string id, string action, int side, float entry, float stop, float target) =>
+    stamp = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    "{\"token\":\"" + f_json_escape(webhookToken) + "\",\"trade_id\":\"" + id + "\",\"source_version\":\"amd_sweep_v1\",\"action\":\"" + action + "\",\"timestamp\":\"" + stamp + "\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(stop, format.mintick) + ",\"target\":" + str.tostring(target, format.mintick) + "}"
+
+string TZ = "America/New_York"
+currentYear = year(timenow, TZ)
+currentMonth = month(timenow, TZ)
+currentDay = dayofmonth(timenow, TZ)
+barYear = year(time, TZ)
+barMonth = month(time, TZ)
+barDay = dayofmonth(time, TZ)
+isToday = barYear == currentYear and barMonth == currentMonth and barDay == currentDay
+inSession = not na(time(timeframe.period, tradeSession, TZ))
+hourET = hour(time, TZ)
+minuteET = minute(time, TZ)
+closeHourET = hour(time_close, TZ)
+closeMinuteET = minute(time_close, TZ)
+hardExitReached = closeHourET > hardExitHour or (closeHourET == hardExitHour and closeMinuteET >= hardExitMinute)
+lunchTime = hourET == 12 or (hourET == 13 and minuteET < 30)
+sessionOK = (isToday or showHistory) and inSession and not hardExitReached and (not avoidLunch or not lunchTime)
+confirmationOK = barstate.isconfirmed // Entries and automatic exits are close-confirmed.
+if syminfo.ticker != "SPY" or not timeframe.isminutes or timeframe.multiplier > 5
+    runtime.error("Use standard SPY 1–5 minute candles.")
+if timeframe.in_seconds(mediumTF) <= timeframe.in_seconds() or timeframe.in_seconds(majorTF) <= timeframe.in_seconds()
+    runtime.error("Medium and major trend timeframes must be higher than the chart.")
+if enableSandboxWebhook and (not autoTrackSignals or optionContracts != 1 or strikeIncrement != 1.0 or expirationText != "0DTE" or hardExitHour != 14 or hardExitMinute != 0)
+    runtime.error("Sandbox JSON requires auto tracking, 1 contract, $1 strikes, 0DTE, and a 14:00 ET cutoff.")
+if amdMaximumRR < amdMinimumRR or finalTargetR < amdMinimumRR
+    runtime.error("Maximum/fallback target R must be at least the minimum target R.")
+if enableSandboxWebhook and str.length(webhookToken) < 32
+    runtime.error("Set the private receiver token before enabling sandbox alerts.")
+
+//=============================================================================
+// BASE INDICATORS
+//=============================================================================
+ema10 = ta.ema(close, emaFastLength)
+ema15 = ta.ema(close, emaSlowLength)
+ema22 = ta.ema(close, emaTrendLength)
+hull = ta.hma(close, hullLength)
+vwapValue = ta.vwap(hlc3)
+rsiValue = ta.rsi(close, rsiLength)
+atr = ta.atr(atrLength)
+atrAverage = ta.sma(atr, atrAverageLength)
+
+[callOptOpen, callOptHigh, callOptLow, callOptClose, callOptType] = request.security(callOptionSymbol, timeframe.period, [open, high, low, close, syminfo.type], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[putOptOpen, putOptHigh, putOptLow, putOptClose, putOptType] = request.security(putOptionSymbol, timeframe.period, [open, high, low, close, syminfo.type], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+callOptionConfigured = callOptionSymbol != syminfo.tickerid and callOptType == "option" and not na(callOptClose)
+putOptionConfigured = putOptionSymbol != syminfo.tickerid and putOptType == "option" and not na(putOptClose)
+if useStrictOptionPremiumExits and (not callOptionConfigured or not putOptionConfigured)
+    runtime.error("Premium exits require actual CALL and PUT option chart symbols; SPY is not an option premium.")
+if enableSandboxWebhook and useStrictOptionPremiumExits
+    runtime.error("Sandbox webhook uses SPY exit levels. Separate option-premium charts are not verified against the worker's selected contract.")
+atrExpanding = atr > atrAverage
+
+[macdLine, macdSignalLine, macdHistogram] = ta.macd(close, macdFastLength, macdSlowLength, macdSignalLength)
+macdBull = macdLine > macdSignalLine and macdHistogram > 0
+macdBear = macdLine < macdSignalLine and macdHistogram < 0
+macdBullIncreasing = macdHistogram > macdHistogram[1]
+macdBearIncreasing = macdHistogram < macdHistogram[1]
+
+[plusDI, minusDI, adx] = ta.dmi(adxLength, adxSmoothing)
+bullDI = plusDI > minusDI
+bearDI = minusDI > plusDI
+adxStrong = adx >= minimumADX
+
+averageVolume = ta.sma(volume, volumeLength)
+float rvol = 0.0
+if averageVolume > 0
+    rvol := volume / averageVolume
+
+rvolOK = rvol >= preferredRVOL
+rvolStrong = rvol >= strongRVOLLevel
+volumeSpike = averageVolume > 0 and volume >= averageVolume * 1.50
+
+emaBull = ema10 > ema15
+emaBear = ema10 < ema15
+fullBullTrend = ema10 > ema15 and ema15 > ema22
+fullBearTrend = ema10 < ema15 and ema15 < ema22
+emaBullSlope = ema10 > ema10[1] and ema15 >= ema15[1]
+emaBearSlope = ema10 < ema10[1] and ema15 <= ema15[1]
+hullBull = hull > hull[1]
+hullBear = hull < hull[1]
+aboveVWAP = close > vwapValue
+belowVWAP = close < vwapValue
+vwapRising = vwapValue > vwapValue[1]
+vwapFalling = vwapValue < vwapValue[1]
+
+//=============================================================================
+// HIGHER TIMEFRAMES
+//=============================================================================
+midClose = request.security(syminfo.tickerid, mediumTF, close[1], lookahead=barmerge.lookahead_on)
+midEMA10 = request.security(syminfo.tickerid, mediumTF, ta.ema(close, emaFastLength)[1], lookahead=barmerge.lookahead_on)
+midEMA15 = request.security(syminfo.tickerid, mediumTF, ta.ema(close, emaSlowLength)[1], lookahead=barmerge.lookahead_on)
+midEMA22 = request.security(syminfo.tickerid, mediumTF, ta.ema(close, emaTrendLength)[1], lookahead=barmerge.lookahead_on)
+midBull = midClose > midEMA15 and midEMA10 > midEMA15
+midBear = midClose < midEMA15 and midEMA10 < midEMA15
+midStrongBull = midEMA10 > midEMA15 and midEMA15 > midEMA22
+midStrongBear = midEMA10 < midEMA15 and midEMA15 < midEMA22
+
+majorClose = request.security(syminfo.tickerid, majorTF, close[1], lookahead=barmerge.lookahead_on)
+majorEMA10 = request.security(syminfo.tickerid, majorTF, ta.ema(close, emaFastLength)[1], lookahead=barmerge.lookahead_on)
+majorEMA15 = request.security(syminfo.tickerid, majorTF, ta.ema(close, emaSlowLength)[1], lookahead=barmerge.lookahead_on)
+majorBull = majorClose > majorEMA15 and majorEMA10 > majorEMA15
+majorBear = majorClose < majorEMA15 and majorEMA10 < majorEMA15
+
+//=============================================================================
+// STRUCTURE AND RSI
+//=============================================================================
+previousHigh = ta.highest(high, structureLength)[1]
+previousLow = ta.lowest(low, structureLength)[1]
+structureHigh = ta.highest(high, structureLength)
+structureLow = ta.lowest(low, structureLength)
+bullStructureBreak = close > previousHigh
+bearStructureBreak = close < previousLow
+rsiBull = rsiValue >= 52
+rsiStrongBull = rsiValue >= 58
+rsiBear = rsiValue <= 48
+rsiStrongBear = rsiValue <= 42
+
+//=============================================================================
+// ORIGINAL WEIGHTED SCORES
+//=============================================================================
+int callScore = 0
+callScore += hullBull ? 10 : 0
+callScore += emaBull ? 8 : 0
+callScore += fullBullTrend ? 7 : 0
+callScore += emaBullSlope ? 5 : 0
+callScore += aboveVWAP ? 10 : 0
+callScore += vwapRising ? 5 : 0
+callScore += midBull ? 8 : 0
+callScore += midStrongBull ? 5 : 0
+callScore += majorBull ? 7 : 0
+callScore += rsiBull ? 5 : 0
+callScore += rsiStrongBull ? 3 : 0
+callScore += macdBull ? 5 : 0
+callScore += macdBullIncreasing ? 3 : 0
+callScore += bullDI ? 5 : 0
+callScore += adxStrong ? 4 : 0
+callScore += rvolOK ? 3 : 0
+callScore += rvolStrong ? 3 : 0
+callScore += volumeSpike ? 2 : 0
+callScore += bullStructureBreak ? 5 : 0
+callScore += atrExpanding ? 4 : 0
+callScore := math.min(callScore, 100)
+
+int putScore = 0
+putScore += hullBear ? 10 : 0
+putScore += emaBear ? 8 : 0
+putScore += fullBearTrend ? 7 : 0
+putScore += emaBearSlope ? 5 : 0
+putScore += belowVWAP ? 10 : 0
+putScore += vwapFalling ? 5 : 0
+putScore += midBear ? 8 : 0
+putScore += midStrongBear ? 5 : 0
+putScore += majorBear ? 7 : 0
+putScore += rsiBear ? 5 : 0
+putScore += rsiStrongBear ? 3 : 0
+putScore += macdBear ? 5 : 0
+putScore += macdBearIncreasing ? 3 : 0
+putScore += bearDI ? 5 : 0
+putScore += adxStrong ? 4 : 0
+putScore += rvolOK ? 3 : 0
+putScore += rvolStrong ? 3 : 0
+putScore += volumeSpike ? 2 : 0
+putScore += bearStructureBreak ? 5 : 0
+putScore += atrExpanding ? 4 : 0
+putScore := math.min(putScore, 100)
+
+callEdge = callScore - putScore
+putEdge = putScore - callScore
+callBias = emaBull and hullBull and aboveVWAP
+putBias = emaBear and hullBear and belowVWAP
+callQualified = callScore >= minimumScore and callEdge >= minimumEdge
+putQualified = putScore >= minimumScore and putEdge >= minimumEdge
+
+string callGrade = "WATCH"
+if callScore >= 90 and callEdge >= 25
+    callGrade := "A+"
+else if callScore >= 82 and callEdge >= 20
+    callGrade := "A"
+else if callScore >= 76 and callEdge >= 15
+    callGrade := "B+"
+else if callQualified
+    callGrade := "B"
+
+string putGrade = "WATCH"
+if putScore >= 90 and putEdge >= 25
+    putGrade := "A+"
+else if putScore >= 82 and putEdge >= 20
+    putGrade := "A"
+else if putScore >= 76 and putEdge >= 15
+    putGrade := "B+"
+else if putQualified
+    putGrade := "B"
+
+float dynamicRR = baseRR
+if adx >= 22
+    dynamicRR := math.max(dynamicRR, 1.50)
+if adx >= 27 and rvol >= 1.10
+    dynamicRR := math.max(dynamicRR, 1.75)
+if adx >= 32 and rvol >= 1.30
+    dynamicRR := math.max(dynamicRR, 2.00)
+dynamicRR := math.min(dynamicRR, 2.00)
+
+//=============================================================================
+// STATE
+// 0 scanning, 2 pending CALL, -2 pending PUT,
+// 1 active CALL, -1 active PUT.
+//=============================================================================
+var int tradeState = 0
+var float lastCallSignalPrice = na
+var float lastPutSignalPrice = na
+var float lastCallSignalATR = na
+var float lastPutSignalATR = na
+var bool callRearmed = true
+var bool putRearmed = true
+var int lastCycleEndBar = na
+
+var float entryPrice = na
+var float stopPrice = na
+var float targetPrice = na
+var float lockedRR = na
+var float initialStopPrice = na
+var float initialRisk = na
+var float trailStopPrice = na
+var float trailExtreme = na
+var bool trailActivated = false
+var float suggestedStrike = na
+var int signalBar = na
+var int signalTime = na
+var int lastTradeBar = na
+var int lockedScore = na
+var int lockedEdge = na
+var string lockedGrade = ""
+var bool respondedToEntry = false
+var bool respondedToExit = false
+var string sandboxTradeId = ""
+var int sandboxSide = 0
+var float sandboxEntry = na
+var float sandboxStop = na
+var float sandboxTarget = na
+var bool sandboxEntrySent = false
+var string exitReason = ""
+var float actualExitPrice = na
+var bool targetTouched = false
+
+var float optionEntryPremium = na
+var float optionStopPremium = na
+var float optionTargetPremium = na
+var float optionBestPremium = na
+var float optionExitPremium = na
+var bool optionTrailActive = false
+
+var box rewardBox = na
+var box riskBox = na
+var line entryLine = na
+var line stopLine = na
+var line targetLine = na
+var label tradeLabel = na
+var label stopLabel = na
+var label targetLabel = na
+var label centerSummary = na
+
+var array<box> archivedReward = array.new<box>()
+var array<box> archivedRisk = array.new<box>()
+var array<line> archivedEntry = array.new<line>()
+var array<line> archivedStop = array.new<line>()
+var array<line> archivedTarget = array.new<line>()
+var array<label> archivedTrade = array.new<label>()
+var array<label> archivedStopLabel = array.new<label>()
+var array<label> archivedTargetLabel = array.new<label>()
+var array<label> archivedCenter = array.new<label>()
+
+//=============================================================================
+// COOLDOWN / MOVEMENT RE-ENTRY
+//=============================================================================
+cooldownOK = (na(lastTradeBar) or bar_index - lastTradeBar > cooldownBars) and (na(lastCycleEndBar) or bar_index - lastCycleEndBar > cooldownBars)
+callTransition = callQualified and not callQualified[1]
+putTransition = putQualified and not putQualified[1]
+
+if barstate.isconfirmed
+    if not callQualified or (not na(lastCallSignalPrice) and close <= lastCallSignalPrice - lastCallSignalATR * reentryResetATR)
+        callRearmed := true
+    if not putQualified or (not na(lastPutSignalPrice) and close >= lastPutSignalPrice + lastPutSignalATR * reentryResetATR)
+        putRearmed := true
+
+bool callMovementReady = enableMovementReentry and (callRearmed or (not na(lastCallSignalPrice) and close >= lastCallSignalPrice + lastCallSignalATR * reentryMoveATR))
+bool putMovementReady = enableMovementReentry and (putRearmed or (not na(lastPutSignalPrice) and close <= lastPutSignalPrice - lastPutSignalATR * reentryMoveATR))
+
+bool pendingMarketChanged = cancelStalePending and barstate.isconfirmed and ((tradeState == 2 and ((putQualified and putBias) or close <= stopPrice or close >= targetPrice)) or (tradeState == -2 and ((callQualified and callBias) or close >= stopPrice or close <= targetPrice)))
+
+if pendingMarketChanged
+    tradeState := 0
+    lastCycleEndBar := bar_index
+    exitReason := "PENDING MARKET CHANGED"
+    signalBar := na
+    signalTime := na
+
+int cycleStateBefore = tradeState
+
+// Named setups use closed bars. ORB levels freeze after 09:45 ET.
+newETDay = ta.change(time("D", "0000-2359", TZ)) != 0
+var float orHigh = na
+var float orLow = na
+var int signalsToday = 0
+var int trapCallBar = na
+var int trapPutBar = na
+if newETDay
+    orHigh := na
+    orLow := na
+    signalsToday := 0
+    trapCallBar := na
+    trapPutBar := na
+inOpeningRange = not na(time(timeframe.period, "0930-0945", TZ))
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+rangeReady = not inOpeningRange and not na(orHigh) and (hourET > 9 or minuteET >= 45)
+orbCall = rangeReady and close > orHigh and close[1] <= orHigh and aboveVWAP and fullBullTrend
+orbPut = rangeReady and close < orLow and close[1] >= orLow and belowVWAP and fullBearTrend
+pullbackCall = fullBullTrend and low <= ema15 and close > ema10 and close > open and aboveVWAP and rsiValue > 50
+pullbackPut = fullBearTrend and high >= ema15 and close < ema10 and close < open and belowVWAP and rsiValue < 50
+vwapCall = close > vwapValue and close[1] <= vwapValue[1] and emaBull and close > open and rsiValue > 50
+vwapPut = close < vwapValue and close[1] >= vwapValue[1] and emaBear and close < open and rsiValue < 50
+[c4, f4, s4] = request.security(syminfo.tickerid, "240", [close[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1]], lookahead=barmerge.lookahead_on)
+[c30, f30, s30, hi30, lo30, a30] = request.security(syminfo.tickerid, "30", [close[1], ta.ema(close, 10)[1], ta.ema(close, 20)[1], ta.highest(high, 12)[1], ta.lowest(low, 12)[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+bull4 = f4 > s4 and c4 > f4
+bear4 = f4 < s4 and c4 < f4
+if barstate.isconfirmed
+    if bear4 and f30 > s30 and high >= hi30 - a30 * 0.5 and low <= hi30
+        trapPutBar := bar_index
+    if bull4 and f30 < s30 and low <= lo30 + a30 * 0.5 and high >= lo30
+        trapCallBar := bar_index
+    if not bear4
+        trapPutBar := na
+    if not bull4
+        trapCallBar := na
+trapPut = timeframe.isminutes and timeframe.multiplier == 5 and bear4 and not na(trapPutBar) and bar_index > trapPutBar and bar_index - trapPutBar <= 18 and bearStructureBreak and close < open
+trapCall = timeframe.isminutes and timeframe.multiplier == 5 and bull4 and not na(trapCallBar) and bar_index > trapCallBar and bar_index - trapCallBar <= 18 and bullStructureBreak and close > open
+namedCall = strategyMode == "Combined" ? orbCall or pullbackCall or vwapCall : strategyMode == "EMA Pullback" ? pullbackCall : strategyMode == "VWAP Reclaim" ? vwapCall : strategyMode == "Opening Range" ? orbCall : trapCall
+namedPut = strategyMode == "Combined" ? orbPut or pullbackPut or vwapPut : strategyMode == "EMA Pullback" ? pullbackPut : strategyMode == "VWAP Reclaim" ? vwapPut : strategyMode == "Opening Range" ? orbPut : trapPut
+strategyCallName = strategyMode == "Original Score" ? "SCORE" : strategyMode == "4HR Trap" ? "4HR TRAP" : orbCall ? "ORB" : pullbackCall ? "EMA PULLBACK" : "VWAP RECLAIM"
+strategyPutName = strategyMode == "Original Score" ? "SCORE" : strategyMode == "4HR Trap" ? "4HR TRAP" : orbPut ? "ORB" : pullbackPut ? "EMA PULLBACK" : "VWAP RECLAIM"
+plot(showOpeningRange and rangeReady ? orHigh : na, "Opening Range High", color=color.new(color.blue, 35), style=plot.style_linebr)
+plot(showOpeningRange and rangeReady ? orLow : na, "Opening Range Low", color=color.new(color.blue, 35), style=plot.style_linebr)
+var string lockedStrategy = ""
+var bool tp1Touched = false
+bool tp1Event = false
+// AMD intermediate-swing method adapted from the user's supplied source.
+// Levels are published when confirmed, never retroactively used for entries.
+amdPH = ta.pivothigh(high[1], amdPivotBars, amdPivotBars)
+amdPL = ta.pivotlow(low[1], amdPivotBars, amdPivotBars)
+amdMicroHigh = ta.highest(high, 3)[1]
+amdMicroLow = ta.lowest(low, 3)[1]
+var float amdLatestPivotHigh = na
+var float amdLatestPivotLow = na
+var int amdLatestHighConfirmed = na
+var int amdLatestLowConfirmed = na
+var float amdLastHigh = na
+var float amdLastLow = na
+var bool amdLastHighWasHigher = false
+var bool amdLastLowWasLower = false
+var array<float> amdITH = array.new<float>()
+var array<int> amdITHConfirmed = array.new<int>()
+var array<float> amdITL = array.new<float>()
+var array<int> amdITLConfirmed = array.new<int>()
+var float amdPremarketHigh = na
+var float amdPremarketLow = na
+var float amdBuyLevel = na
+var float amdSellLevel = na
+var int amdBuyConfirmedBar = na
+var int amdSellConfirmedBar = na
+var float amdUsedBuyLevel = na
+var float amdUsedSellLevel = na
+var array<float> amdConsumedBuyLevels = array.new<float>()
+var array<float> amdConsumedSellLevels = array.new<float>()
+var int amdStage = 0
+var int amdStageBar = na
+var float amdSweepWick = na
+var float amdSweepATR = na
+var float amdBreakLevel = na
+var float amdFrozenLevel = na
+bool amdCallReady = false
+bool amdPutReady = false
+bool amdBullSweep = false
+bool amdBearSweep = false
+bool amdBullBreak = false
+bool amdBearBreak = false
+
+amdPremarket = not na(time(timeframe.period, "0400-0930", TZ))
+if barstate.isconfirmed
+    if newETDay
+        array.clear(amdITH)
+        array.clear(amdITHConfirmed)
+        array.clear(amdITL)
+        array.clear(amdITLConfirmed)
+        amdLatestPivotHigh := na
+        amdLatestPivotLow := na
+        amdLatestHighConfirmed := na
+        amdLatestLowConfirmed := na
+        amdLastHigh := na
+        amdLastLow := na
+        amdLastHighWasHigher := false
+        amdLastLowWasLower := false
+        amdPremarketHigh := na
+        amdPremarketLow := na
+        amdBuyLevel := na
+        amdSellLevel := na
+        amdBuyConfirmedBar := na
+        amdSellConfirmedBar := na
+        amdUsedBuyLevel := na
+        amdUsedSellLevel := na
+        array.clear(amdConsumedBuyLevels)
+        array.clear(amdConsumedSellLevels)
+        amdStage := 0
+    if amdPremarket
+        amdPremarketHigh := na(amdPremarketHigh) ? high : math.max(amdPremarketHigh, high)
+        amdPremarketLow := na(amdPremarketLow) ? low : math.min(amdPremarketLow, low)
+
+    // Resolve a pending setup before looking for a new one. No same-bar stages.
+    if amdStage != 0
+        breachedWick = amdStage > 0 ? low <= amdSweepWick : high >= amdSweepWick
+        expiredStage = bar_index - amdStageBar > (math.abs(amdStage) == 1 ? amdBreakExpiry : amdRetestExpiry)
+        if breachedWick or expiredStage or not sessionOK or tradeState != 0
+            amdStage := 0
+    if math.abs(amdStage) == 2 and bar_index > amdStageBar
+        longRetest = low <= amdBreakLevel + amdSweepATR * amdRetestTolerance and low > amdSweepWick and close > amdBreakLevel and close > open
+        shortRetest = high >= amdBreakLevel - amdSweepATR * amdRetestTolerance and high < amdSweepWick and close < amdBreakLevel and close < open
+        if amdStage == 2 and longRetest and callBias
+            amdCallReady := true
+            amdStage := 0
+        else if amdStage == -2 and shortRetest and putBias
+            amdPutReady := true
+            amdStage := 0
+    if math.abs(amdStage) == 1 and bar_index > amdStageBar
+        candleRange = math.max(high - low, syminfo.mintick)
+        displacement = math.abs(close - open) >= atr * amdDisplacementATR and candleRange <= atr * amdMaxDisplacementATR and rvol >= amdDisplacementRVOL and adx >= minimumADX
+        if amdStage == 1 and displacement and close > amdBreakLevel and close > open and (high - close) / candleRange <= 0.25 and callBias
+            amdStage := 2
+            amdStageBar := bar_index
+            amdBullBreak := true
+        else if amdStage == -1 and displacement and close < amdBreakLevel and close < open and (close - low) / candleRange <= 0.25 and putBias
+            amdStage := -2
+            amdStageBar := bar_index
+            amdBearBreak := true
+
+    // Use levels calculated on an earlier bar, not newly confirmed levels.
+    if amdStage == 0 and not newETDay and not amdCallReady and not amdPutReady and tradeState == 0 and sessionOK and cooldownOK
+        candleRange = math.max(high - low, syminfo.mintick)
+        sellLevel = amdSellLevel[1]
+        buyLevel = amdBuyLevel[1]
+        reclaimedLow = not na(sellLevel) and not na(amdSellConfirmedBar[1]) and bar_index - amdSellConfirmedBar[1] <= amdLevelAge and array.indexof(amdConsumedSellLevels, sellLevel) < 0 and low < sellLevel - syminfo.mintick and close > sellLevel and close > open and (close - low) / candleRange >= 0.65
+        reclaimedHigh = not na(buyLevel) and not na(amdBuyConfirmedBar[1]) and bar_index - amdBuyConfirmedBar[1] <= amdLevelAge and array.indexof(amdConsumedBuyLevels, buyLevel) < 0 and high > buyLevel + syminfo.mintick and close < buyLevel and close < open and (high - close) / candleRange >= 0.65
+        if reclaimedLow and not reclaimedHigh
+            amdStage := 1
+            amdStageBar := bar_index
+            amdSweepWick := low
+            amdSweepATR := atr
+            amdBreakLevel := amdMicroHigh
+            amdFrozenLevel := sellLevel
+            amdUsedSellLevel := sellLevel
+            array.push(amdConsumedSellLevels, sellLevel)
+            if array.size(amdConsumedSellLevels) > 64
+                array.shift(amdConsumedSellLevels)
+            amdBullSweep := true
+        else if reclaimedHigh and not reclaimedLow
+            amdStage := -1
+            amdStageBar := bar_index
+            amdSweepWick := high
+            amdSweepATR := atr
+            amdBreakLevel := amdMicroLow
+            amdFrozenLevel := buyLevel
+            amdUsedBuyLevel := buyLevel
+            array.push(amdConsumedBuyLevels, buyLevel)
+            if array.size(amdConsumedBuyLevels) > 64
+                array.shift(amdConsumedBuyLevels)
+            amdBearSweep := true
+
+    // The AMD intermediate classification itself is only available after the
+    // NEXT pivot confirms. Recording a past pivot's price does not backdate its availability.
+    pivotSameDay = year(time[amdPivotBars + 1], TZ) == barYear and month(time[amdPivotBars + 1], TZ) == barMonth and dayofmonth(time[amdPivotBars + 1], TZ) == barDay
+    if not na(amdPH) and pivotSameDay
+        amdLatestPivotHigh := amdPH
+        amdLatestHighConfirmed := bar_index
+        if not na(amdLastHigh) and amdPH < amdLastHigh and amdLastHighWasHigher
+            array.push(amdITH, amdLastHigh)
+            array.push(amdITHConfirmed, bar_index)
+            if array.size(amdITH) > 64
+                array.shift(amdITH)
+                array.shift(amdITHConfirmed)
+        amdLastHighWasHigher := not na(amdLastHigh) and amdPH > amdLastHigh
+        amdLastHigh := amdPH
+    if not na(amdPL) and pivotSameDay
+        amdLatestPivotLow := amdPL
+        amdLatestLowConfirmed := bar_index
+        if not na(amdLastLow) and amdPL > amdLastLow and amdLastLowWasLower
+            array.push(amdITL, amdLastLow)
+            array.push(amdITLConfirmed, bar_index)
+            if array.size(amdITL) > 64
+                array.shift(amdITL)
+                array.shift(amdITLConfirmed)
+        amdLastLowWasLower := not na(amdLastLow) and amdPL < amdLastLow
+        amdLastLow := amdPL
+
+    // Recompute every closed bar, and clear unavailable/stale selections.
+    amdBuyLevel := na
+    amdSellLevel := na
+    amdBuyConfirmedBar := na
+    amdSellConfirmedBar := na
+    int highCount = array.size(amdITH)
+    if highCount > 0
+        for offset = 0 to highCount - 1
+            index = highCount - 1 - offset
+            level = array.get(amdITH, index)
+            recent = bar_index - array.get(amdITHConfirmed, index) <= amdLevelAge
+            eligible = not amdPremarketFilter or (not na(amdPremarketHigh) and level >= amdPremarketHigh)
+            if recent and eligible and array.indexof(amdConsumedBuyLevels, level) < 0
+                amdBuyLevel := level
+                amdBuyConfirmedBar := array.get(amdITHConfirmed, index)
+                break
+    int lowCount = array.size(amdITL)
+    if lowCount > 0
+        for offset = 0 to lowCount - 1
+            index = lowCount - 1 - offset
+            level = array.get(amdITL, index)
+            recent = bar_index - array.get(amdITLConfirmed, index) <= amdLevelAge
+            eligible = not amdPremarketFilter or (not na(amdPremarketLow) and level <= amdPremarketLow)
+            if recent and eligible and array.indexof(amdConsumedSellLevels, level) < 0
+                amdSellLevel := level
+                amdSellConfirmedBar := array.get(amdITLConfirmed, index)
+                break
+
+    // Fallbacks use already confirmed levels; no backdated pivot availability.
+    if amdPivotFallback and not amdPremarketFilter
+        if na(amdBuyLevel) and not na(amdLatestPivotHigh) and bar_index - amdLatestHighConfirmed <= amdLevelAge and array.indexof(amdConsumedBuyLevels, amdLatestPivotHigh) < 0
+            amdBuyLevel := amdLatestPivotHigh
+            amdBuyConfirmedBar := amdLatestHighConfirmed
+        if na(amdSellLevel) and not na(amdLatestPivotLow) and bar_index - amdLatestLowConfirmed <= amdLevelAge and array.indexof(amdConsumedSellLevels, amdLatestPivotLow) < 0
+            amdSellLevel := amdLatestPivotLow
+            amdSellConfirmedBar := amdLatestLowConfirmed
+        if na(amdBuyLevel) and rangeReady and array.indexof(amdConsumedBuyLevels, orHigh) < 0
+            amdBuyLevel := orHigh
+            amdBuyConfirmedBar := bar_index
+        if na(amdSellLevel) and rangeReady and array.indexof(amdConsumedSellLevels, orLow) < 0
+            amdSellLevel := orLow
+            amdSellConfirmedBar := bar_index
+    // A level pierced without a qualified reclaim is already taken; do not
+    // later mislabel its breakdown/retest as the original first liquidity grab.
+    if not newETDay
+        previouslyKnownHigh = amdBuyLevel[1]
+        previouslyKnownLow = amdSellLevel[1]
+        if not na(previouslyKnownHigh) and high > previouslyKnownHigh + syminfo.mintick and array.indexof(amdConsumedBuyLevels, previouslyKnownHigh) < 0
+            array.push(amdConsumedBuyLevels, previouslyKnownHigh)
+            if array.size(amdConsumedBuyLevels) > 64
+                array.shift(amdConsumedBuyLevels)
+        if not na(previouslyKnownLow) and low < previouslyKnownLow - syminfo.mintick and array.indexof(amdConsumedSellLevels, previouslyKnownLow) < 0
+            array.push(amdConsumedSellLevels, previouslyKnownLow)
+            if array.size(amdConsumedSellLevels) > 64
+                array.shift(amdConsumedSellLevels)
+
+amdCallStop = math.round_to_mintick(math.min(amdSweepWick - amdSweepATR * amdWickBuffer, close - amdSweepATR * amdMinimumStopATR))
+amdPutStop = math.round_to_mintick(math.max(amdSweepWick + amdSweepATR * amdWickBuffer, close + amdSweepATR * amdMinimumStopATR))
+amdCallRisk = close - amdCallStop
+amdPutRisk = amdPutStop - close
+// Find the nearest recorded intermediate obstruction in the trade direction.
+float amdNextHigh = na
+float amdNextLow = na
+if array.size(amdITH) > 0
+    for index = 0 to array.size(amdITH) - 1
+        level = array.get(amdITH, index)
+        if level > close and bar_index - array.get(amdITHConfirmed, index) <= amdLevelAge
+            amdNextHigh := na(amdNextHigh) ? level : math.min(amdNextHigh, level)
+if array.size(amdITL) > 0
+    for index = 0 to array.size(amdITL) - 1
+        level = array.get(amdITL, index)
+        if level < close and bar_index - array.get(amdITLConfirmed, index) <= amdLevelAge
+            amdNextLow := na(amdNextLow) ? level : math.max(amdNextLow, level)
+// Include confirmed ordinary pivots and the frozen opening range as target
+// obstacles, not future prices. Only levels ahead of this entry are relevant.
+if not na(amdLatestPivotHigh) and amdLatestPivotHigh > close and bar_index - amdLatestHighConfirmed <= amdLevelAge
+    amdNextHigh := na(amdNextHigh) ? amdLatestPivotHigh : math.min(amdNextHigh, amdLatestPivotHigh)
+if not na(amdLatestPivotLow) and amdLatestPivotLow < close and bar_index - amdLatestLowConfirmed <= amdLevelAge
+    amdNextLow := na(amdNextLow) ? amdLatestPivotLow : math.max(amdNextLow, amdLatestPivotLow)
+if rangeReady and orHigh > close
+    amdNextHigh := na(amdNextHigh) ? orHigh : math.min(amdNextHigh, orHigh)
+if rangeReady and orLow < close
+    amdNextLow := na(amdNextLow) ? orLow : math.max(amdNextLow, orLow)
+amdFallbackRR = math.min(finalTargetR, amdMaximumRR)
+amdCallTarget = math.round_to_mintick(na(amdNextHigh) ? close + amdCallRisk * amdFallbackRR : math.min(amdNextHigh - amdSweepATR * amdTargetBufferATR, close + amdCallRisk * amdMaximumRR))
+amdPutTarget = math.round_to_mintick(na(amdNextLow) ? close - amdPutRisk * amdFallbackRR : math.max(amdNextLow + amdSweepATR * amdTargetBufferATR, close - amdPutRisk * amdMaximumRR))
+amdCallTargetR = amdCallRisk > 0 ? (amdCallTarget - close) / amdCallRisk : na
+amdPutTargetR = amdPutRisk > 0 ? (close - amdPutTarget) / amdPutRisk : na
+// Unknown opposing levels get an explicitly labeled R fallback. Recorded
+// barriers too close to support minimum R still block the trade by default.
+amdCallRoom = amdCallTarget > close and (not amdRequireRoom or amdCallTargetR >= amdMinimumRR)
+amdPutRoom = amdPutTarget < close and (not amdRequireRoom or amdPutTargetR >= amdMinimumRR)
+var string lockedTargetBasis = ""
+plot(amdShowLevels ? amdBuyLevel : na, "AMD confirmed intermediate high", color=color.new(color.red, 20), style=plot.style_stepline)
+plot(amdShowLevels ? amdSellLevel : na, "AMD confirmed intermediate low", color=color.new(color.teal, 20), style=plot.style_stepline)
+plotshape(amdShowStages and amdBullSweep, title="Confirmed sellside reclaim", text="SWEEP", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.tiny)
+plotshape(amdShowStages and amdBearSweep, title="Confirmed buyside reclaim", text="SWEEP", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.tiny)
+
+float proposedCallRisk = amdCallReady ? amdCallRisk : na
+float proposedPutRisk = amdPutReady ? amdPutRisk : na
+strategyRiskOK = signalsToday < maxDailySignals and math.abs(close - ema15) <= atr * maxEntryStretch // Volume is tested on displacement, not the quieter retest.
+callSetup = tradeState == 0 and sessionOK and confirmationOK and cooldownOK and strategyRiskOK and amdCallReady and amdCallRoom and proposedCallRisk > 0 and proposedCallRisk <= atr * maxStopATR and (not useScoreGate or callQualified) and (strategyMode == "AMD Sweep + Retest" or (strategyMode == "Original Score" ? callBias and callQualified : namedCall))
+putSetup = tradeState == 0 and sessionOK and confirmationOK and cooldownOK and strategyRiskOK and amdPutReady and amdPutRoom and proposedPutRisk > 0 and proposedPutRisk <= atr * maxStopATR and (not useScoreGate or putQualified) and (strategyMode == "AMD Sweep + Retest" or (strategyMode == "Original Score" ? putBias and putQualified : namedPut))
+
+var string lastRejectedSetup = "NONE"
+string amdStatus = "WAIT FRESH SWEEP"
+if hardExitReached
+    amdStatus := "CUTOFF — NO NEW ENTRIES"
+else if not inSession
+    amdStatus := "OUTSIDE ENTRY WINDOW"
+else if avoidLunch and lunchTime
+    amdStatus := "LUNCH FILTER"
+else if signalsToday >= maxDailySignals
+    amdStatus := "DAILY SIGNAL LIMIT"
+else if not cooldownOK
+    amdStatus := "COOLDOWN"
+else if amdPremarketFilter and (na(amdPremarketHigh) or na(amdPremarketLow))
+    amdStatus := "PREMARKET DATA MISSING"
+else if na(amdBuyLevel) and na(amdSellLevel)
+    amdStatus := "WAIT CONFIRMED LEVELS"
+else if math.abs(amdStage) == 1
+    amdStatus := "RECLAIMED — WAIT DISPLACEMENT"
+else if math.abs(amdStage) == 2
+    amdStatus := "BROKEN — WAIT RETEST"
+if barstate.isconfirmed and (amdCallReady or amdPutReady)
+    candidateRisk = amdCallReady ? proposedCallRisk : proposedPutRisk
+    candidateRoom = amdCallReady ? amdCallRoom : amdPutRoom
+    candidateScore = amdCallReady ? callQualified : putQualified
+    if not strategyRiskOK
+        lastRejectedSetup := signalsToday >= maxDailySignals ? "DAILY LIMIT" : "ENTRY TOO STRETCHED"
+    else if na(candidateRisk) or candidateRisk <= 0 or candidateRisk > atr * maxStopATR
+        lastRejectedSetup := "STOP DISTANCE REJECTED"
+    else if not candidateRoom
+        lastRejectedSetup := "TARGET TOO CLOSE"
+    else if useScoreGate and not candidateScore
+        lastRejectedSetup := "OPTIONAL SCORE GATE"
+    else if not callSetup and not putSetup
+        lastRejectedSetup := "SELECTED EXTRA ENTRY FILTER"
+    else
+        lastRejectedSetup := "NONE"
+
+//=============================================================================
+// CREATE CALL SETUP
+//=============================================================================
+if callSetup
+    signalsToday += 1
+    lockedStrategy := "AMD SWEEP / BREAK / RETEST" + (strategyMode == "AMD Sweep + Retest" ? "" : " + " + strategyCallName)
+    tp1Touched := false
+    trapCallBar := na
+    entryPrice := close
+
+    stopPrice := amdCallStop // Frozen beyond the reclaimed sweep wick.
+
+    float callRisk = entryPrice - stopPrice
+    initialStopPrice := stopPrice
+    initialRisk := callRisk
+    trailStopPrice := na
+    trailExtreme := entryPrice
+    trailActivated := false
+    targetPrice := amdCallTarget
+    lockedRR := (targetPrice - entryPrice) / callRisk
+    lockedTargetBasis := na(amdNextHigh) ? "R FALLBACK (NO MAPPED HIGH)" : "OPPOSING LIQUIDITY"
+
+    float nearestITMCall = math.floor((entryPrice - syminfo.mintick) / strikeIncrement) * strikeIncrement
+    suggestedStrike := enableSandboxWebhook ? math.round(entryPrice) : nearestITMCall - (itmDepth - 1) * strikeIncrement
+
+    signalBar := bar_index
+    signalTime := time
+    lastTradeBar := bar_index
+    lockedScore := callScore
+    lockedEdge := callEdge
+    lockedGrade := callGrade
+    respondedToEntry := false
+    respondedToExit := false
+    exitReason := ""
+    actualExitPrice := na
+    targetTouched := false
+    lastCallSignalPrice := close
+    lastCallSignalATR := atr
+    callRearmed := false
+    optionEntryPremium := na
+    optionStopPremium := na
+    optionTargetPremium := na
+    optionBestPremium := na
+    optionExitPremium := na
+    optionTrailActive := false
+    tradeState := 2
+
+    if not enableSandboxWebhook
+        alert("SPY CALL SETUP | Entry " + str.tostring(entryPrice, format.mintick) + " | ITM Strike " + str.tostring(suggestedStrike, "#") + "C | Stop " + str.tostring(stopPrice, format.mintick) + " | Target " + str.tostring(targetPrice, format.mintick), alert.freq_once_per_bar_close)
+
+//=============================================================================
+// CREATE PUT SETUP
+//=============================================================================
+if putSetup
+    signalsToday += 1
+    lockedStrategy := "AMD SWEEP / BREAK / RETEST" + (strategyMode == "AMD Sweep + Retest" ? "" : " + " + strategyPutName)
+    tp1Touched := false
+    trapPutBar := na
+    entryPrice := close
+
+    stopPrice := amdPutStop // Frozen beyond the reclaimed sweep wick.
+
+    float putRisk = stopPrice - entryPrice
+    initialStopPrice := stopPrice
+    initialRisk := putRisk
+    trailStopPrice := na
+    trailExtreme := entryPrice
+    trailActivated := false
+    targetPrice := amdPutTarget
+    lockedRR := (entryPrice - targetPrice) / putRisk
+    lockedTargetBasis := na(amdNextLow) ? "R FALLBACK (NO MAPPED LOW)" : "OPPOSING LIQUIDITY"
+
+    float nearestITMPut = math.ceil((entryPrice + syminfo.mintick) / strikeIncrement) * strikeIncrement
+    suggestedStrike := enableSandboxWebhook ? math.round(entryPrice) : nearestITMPut + (itmDepth - 1) * strikeIncrement
+
+    signalBar := bar_index
+    signalTime := time
+    lastTradeBar := bar_index
+    lockedScore := putScore
+    lockedEdge := putEdge
+    lockedGrade := putGrade
+    respondedToEntry := false
+    respondedToExit := false
+    exitReason := ""
+    actualExitPrice := na
+    targetTouched := false
+    lastPutSignalPrice := close
+    lastPutSignalATR := atr
+    putRearmed := false
+    optionEntryPremium := na
+    optionStopPremium := na
+    optionTargetPremium := na
+    optionBestPremium := na
+    optionExitPremium := na
+    optionTrailActive := false
+    tradeState := -2
+
+    if not enableSandboxWebhook
+        alert("SPY PUT SETUP | Entry " + str.tostring(entryPrice, format.mintick) + " | ITM Strike " + str.tostring(suggestedStrike, "#") + "P | Stop " + str.tostring(stopPrice, format.mintick) + " | Target " + str.tostring(targetPrice, format.mintick), alert.freq_once_per_bar_close)
+
+//=============================================================================
+// ACCEPT / AUTOMATICALLY TRACK
+//=============================================================================
+entryYES = autoTrackSignals or enteredResponse == "YES"
+entryNO = not autoTrackSignals and enteredResponse == "NO"
+
+if (autoTrackSignals or barstate.islast) and tradeState == 2 and entryYES and not respondedToEntry
+    tradeState := 1
+    respondedToEntry := true
+
+    if useStrictOptionPremiumExits and callOptionConfigured
+        optionEntryPremium := callOptClose
+        float optionPctStop = optionEntryPremium * (1.0 - optionStopPct / 100.0)
+        float maxLossPerContract = maxOptionLossDollars / (optionContracts * 100.0)
+        float optionDollarStop = math.max(syminfo.mintick, optionEntryPremium - maxLossPerContract)
+
+        if useOptionDollarRiskCap
+            optionStopPremium := math.max(optionPctStop, optionDollarStop)
+        else
+            optionStopPremium := optionPctStop
+
+        float optionPctTarget = optionEntryPremium * (1.0 + optionTargetPct / 100.0)
+        float profitPerContract = optionProfitTargetDollars / (optionContracts * 100.0)
+        float optionDollarTarget = optionEntryPremium + profitPerContract
+
+        if useOptionDollarTargetCap
+            optionTargetPremium := math.min(optionPctTarget, optionDollarTarget)
+        else
+            optionTargetPremium := optionPctTarget
+
+        optionBestPremium := optionEntryPremium
+        optionExitPremium := na
+        optionTrailActive := false
+
+    sandboxEntrySent := false
+    if barstate.isconfirmed and barstate.isrealtime and enableSandboxWebhook
+        sandboxTradeId := "AMD-" + timeframe.period + "-" + str.tostring(signalTime)
+        sandboxSide := 1
+        sandboxEntry := math.round_to_mintick(entryPrice)
+        sandboxStop := math.round_to_mintick(initialStopPrice)
+        sandboxTarget := math.round_to_mintick(targetPrice)
+        alert(f_sandbox_payload(sandboxTradeId, "ENTRY", sandboxSide, sandboxEntry, sandboxStop, sandboxTarget), alert.freq_once_per_bar_close)
+        sandboxEntrySent := true
+
+    label.new(x=time, y=entryPrice, text=autoTrackSignals ? "CALL SIGNAL TRACKED" : "CALL ENTERED", xloc=xloc.bar_time, style=label.style_label_up, color=color.lime, textcolor=color.white)
+
+if (autoTrackSignals or barstate.islast) and tradeState == -2 and entryYES and not respondedToEntry
+    tradeState := -1
+    respondedToEntry := true
+
+    if useStrictOptionPremiumExits and putOptionConfigured
+        optionEntryPremium := putOptClose
+        float optionPctStop = optionEntryPremium * (1.0 - optionStopPct / 100.0)
+        float maxLossPerContract = maxOptionLossDollars / (optionContracts * 100.0)
+        float optionDollarStop = math.max(syminfo.mintick, optionEntryPremium - maxLossPerContract)
+
+        if useOptionDollarRiskCap
+            optionStopPremium := math.max(optionPctStop, optionDollarStop)
+        else
+            optionStopPremium := optionPctStop
+
+        float optionPctTarget = optionEntryPremium * (1.0 + optionTargetPct / 100.0)
+        float profitPerContract = optionProfitTargetDollars / (optionContracts * 100.0)
+        float optionDollarTarget = optionEntryPremium + profitPerContract
+
+        if useOptionDollarTargetCap
+            optionTargetPremium := math.min(optionPctTarget, optionDollarTarget)
+        else
+            optionTargetPremium := optionPctTarget
+
+        optionBestPremium := optionEntryPremium
+        optionExitPremium := na
+        optionTrailActive := false
+
+    sandboxEntrySent := false
+    if barstate.isconfirmed and barstate.isrealtime and enableSandboxWebhook
+        sandboxTradeId := "AMD-" + timeframe.period + "-" + str.tostring(signalTime)
+        sandboxSide := -1
+        sandboxEntry := math.round_to_mintick(entryPrice)
+        sandboxStop := math.round_to_mintick(initialStopPrice)
+        sandboxTarget := math.round_to_mintick(targetPrice)
+        alert(f_sandbox_payload(sandboxTradeId, "ENTRY", sandboxSide, sandboxEntry, sandboxStop, sandboxTarget), alert.freq_once_per_bar_close)
+        sandboxEntrySent := true
+
+    label.new(x=time, y=entryPrice, text=autoTrackSignals ? "PUT SIGNAL TRACKED" : "PUT ENTERED", xloc=xloc.bar_time, style=label.style_label_down, color=color.red, textcolor=color.white)
+
+//=============================================================================
+// SKIP / PENDING EXPIRATION
+//=============================================================================
+if barstate.islast and (tradeState == 2 or tradeState == -2) and entryNO and not respondedToEntry
+    respondedToEntry := true
+    exitReason := "SKIPPED"
+    tradeState := 0
+    entryPrice := na
+    stopPrice := na
+    targetPrice := na
+    suggestedStrike := na
+    initialStopPrice := na
+    initialRisk := na
+    trailStopPrice := na
+    trailExtreme := na
+    trailActivated := false
+    targetTouched := false
+    signalBar := na
+    signalTime := na
+
+pendingSetup = tradeState == 2 or tradeState == -2
+pendingExpired = pendingSetup and not na(signalBar) and bar_index - signalBar >= pendingExpiryBars
+
+if pendingExpired and (autoTrackSignals or enteredResponse == "WAITING")
+    exitReason := "SETUP EXPIRED"
+    tradeState := 0
+    entryPrice := na
+    stopPrice := na
+    targetPrice := na
+    suggestedStrike := na
+    initialStopPrice := na
+    initialRisk := na
+    trailStopPrice := na
+    trailExtreme := na
+    trailActivated := false
+    targetTouched := false
+    signalBar := na
+    signalTime := na
+
+//=============================================================================
+// OPTION-PREMIUM EXIT ENGINE
+//=============================================================================
+if barstate.isconfirmed and useStrictOptionPremiumExits and callOptionConfigured and tradeState == 1 and not na(optionEntryPremium) and bar_index > signalBar
+    if callOptLow <= optionStopPremium
+        optionExitPremium := math.min(callOptOpen, optionStopPremium)
+        exitReason := optionTrailActive ? "OPTION TRAIL EXIT" : "OPTION PREMIUM SL"
+        label.new(bar_index, close, "CALL OPTION SL\n" + str.tostring(optionExitPremium, "#.##"), color=color.red, textcolor=color.white)
+        tradeState := 0
+    else if callOptHigh >= optionTargetPremium and not optionUsePremiumTrail
+        optionExitPremium := optionTargetPremium
+        exitReason := "OPTION TARGET HIT"
+        label.new(bar_index, close, "CALL OPTION TP\n" + str.tostring(optionExitPremium, "#.##"), color=color.teal, textcolor=color.white)
+        tradeState := 0
+    else
+        optionBestPremium := math.max(optionBestPremium, callOptHigh)
+        if callOptHigh >= optionTargetPremium
+            optionTrailActive := true
+        if optionTrailActive
+            optionStopPremium := math.max(optionStopPremium, optionBestPremium * (1.0 - optionTrailGivebackPct / 100.0))
+
+if barstate.isconfirmed and useStrictOptionPremiumExits and putOptionConfigured and tradeState == -1 and not na(optionEntryPremium) and bar_index > signalBar
+    if putOptLow <= optionStopPremium
+        optionExitPremium := math.min(putOptOpen, optionStopPremium)
+        exitReason := optionTrailActive ? "OPTION TRAIL EXIT" : "OPTION PREMIUM SL"
+        label.new(bar_index, close, "PUT OPTION SL\n" + str.tostring(optionExitPremium, "#.##"), color=color.red, textcolor=color.white)
+        tradeState := 0
+    else if putOptHigh >= optionTargetPremium and not optionUsePremiumTrail
+        optionExitPremium := optionTargetPremium
+        exitReason := "OPTION TARGET HIT"
+        label.new(bar_index, close, "PUT OPTION TP\n" + str.tostring(optionExitPremium, "#.##"), color=color.teal, textcolor=color.white)
+        tradeState := 0
+    else
+        optionBestPremium := math.max(optionBestPremium, putOptHigh)
+        if putOptHigh >= optionTargetPremium
+            optionTrailActive := true
+        if optionTrailActive
+            optionStopPremium := math.max(optionStopPremium, optionBestPremium * (1.0 - optionTrailGivebackPct / 100.0))
+
+//=============================================================================
+// HARD EXIT
+//=============================================================================
+bool hardExitEvent = false
+
+if barstate.isconfirmed and (isToday or showHistory) and hardExitReached
+    if tradeState == 1 or tradeState == -1
+        bool hardExitWasCall = tradeState == 1
+        actualExitPrice := open
+
+        if useStrictOptionPremiumExits
+            if hardExitWasCall and callOptionConfigured
+                optionExitPremium := callOptOpen
+            else if not hardExitWasCall and putOptionConfigured
+                optionExitPremium := putOptOpen
+
+        exitReason := "2PM HARD EXIT"
+        hardExitEvent := true
+
+        label.new(x=time, y=actualExitPrice, text=hardExitWasCall ? "CALL EXIT\nHARD CUTOFF" : "PUT EXIT\nHARD CUTOFF", xloc=xloc.bar_time, style=hardExitWasCall ? label.style_label_down : label.style_label_up, color=color.orange, textcolor=color.white, size=size.small)
+        if not enableSandboxWebhook
+            alert((hardExitWasCall ? "SPY CALL" : "SPY PUT") + " | HARD EXIT | SPY " + str.tostring(actualExitPrice, format.mintick), alert.freq_once_per_bar)
+
+        tradeState := 0
+        targetTouched := false
+        trailActivated := false
+
+    else if tradeState == 2 or tradeState == -2
+        exitReason := "2PM SETUP CANCELLED"
+        hardExitEvent := true
+        tradeState := 0
+        entryPrice := na
+        stopPrice := na
+        targetPrice := na
+        suggestedStrike := na
+        initialStopPrice := na
+        initialRisk := na
+        trailStopPrice := na
+        trailExtreme := na
+        trailActivated := false
+        targetTouched := false
+        signalBar := na
+        signalTime := na
+
+//=============================================================================
+// REVERSAL / MOMENTUM / RUNNER CLASSIFICATION
+//=============================================================================
+callReversal = enableReversalExit and tradeState == 1 and putScore >= reversalScore and putEdge >= reversalEdge and emaBear and hullBear and belowVWAP
+putReversal = enableReversalExit and tradeState == -1 and callScore >= reversalScore and callEdge >= reversalEdge and emaBull and hullBull and aboveVWAP
+
+callMomentumExit = enableMomentumExit and tradeState == 1 and barstate.isconfirmed and close < ema15 and hullBear and macdBear and callScore < momentumExitScore and callEdge < momentumExitEdge
+putMomentumExit = enableMomentumExit and tradeState == -1 and barstate.isconfirmed and close > ema15 and hullBull and macdBull and putScore < momentumExitScore and putEdge < momentumExitEdge
+
+strongCallTrend = tradeState == 1 and callScore >= 82 and callEdge >= 25 and adx >= 28 and fullBullTrend and midBull and majorBull and aboveVWAP
+veryStrongCallTrend = strongCallTrend and callScore >= 88 and callEdge >= 35 and adx >= 35 and rsiValue >= 58
+strongPutTrend = tradeState == -1 and putScore >= 82 and putEdge >= 25 and adx >= 28 and fullBearTrend and midBear and majorBear and belowVWAP
+veryStrongPutTrend = strongPutTrend and putScore >= 88 and putEdge >= 35 and adx >= 35 and rsiValue <= 42
+
+float runnerLowSeries = ta.lowest(low, runnerStructureLookback)
+float runnerHighSeries = ta.highest(high, runnerStructureLookback)
+float liveTrailActivationR = trailActivationR
+float liveTrailATR = trailATRMultiplier
+
+if strongCallTrend or strongPutTrend
+    liveTrailActivationR := strongTrailActivationR
+    liveTrailATR := strongTrailATRMultiplier
+
+if veryStrongCallTrend or veryStrongPutTrend
+    liveTrailActivationR := veryStrongTrailActivationR
+    liveTrailATR := veryStrongTrailATRMultiplier
+
+//=============================================================================
+// CALL UNDERLYING EXIT / ADAPTIVE TRAIL
+//=============================================================================
+effectiveTP1R = math.min(tp1R, lockedRR)
+plot((tradeState == 1 or tradeState == -1) and not useStrictOptionPremiumExits ? entryPrice + (tradeState == 1 ? 1 : -1) * initialRisk * effectiveTP1R : na, "TP1 PROFIT TAKING", color=color.yellow, linewidth=2, style=plot.style_linebr)
+if barstate.isconfirmed and not (useStrictOptionPremiumExits and callOptionConfigured) and tradeState == 1 and not na(signalBar) and bar_index > signalBar
+    float callStopForThisBar = stopPrice
+
+    if low <= callStopForThisBar
+        exitReason := trailActivated ? "TRAIL STOP HIT" : "STOP HIT"
+        actualExitPrice := math.min(open, callStopForThisBar)
+        label.new(x=time, y=callStopForThisBar, text=trailActivated ? "CALL TRAIL SL" : "CALL SL", xloc=xloc.bar_time, style=label.style_label_down, color=color.red, textcolor=color.white)
+        tradeState := 0
+    else
+        if not tp1Touched and high >= entryPrice + initialRisk * effectiveTP1R
+            tp1Touched := true
+            tp1Event := true
+            label.new(bar_index, entryPrice + initialRisk * effectiveTP1R * 1, "CALL TP1 — TAKE PROFIT\n" + str.tostring(entryPrice + initialRisk * effectiveTP1R * 1, format.mintick), style=label.style_label_left, color=color.teal, textcolor=color.white, size=size.normal)
+            if not enableSandboxWebhook
+                alert("CALL TP1 | Profit-taking level touched", alert.freq_once_per_bar_close)
+        trailExtreme := na(trailExtreme) ? high : math.max(trailExtreme, high)
+        float currentCallR = initialRisk > 0 ? (trailExtreme - entryPrice) / initialRisk : 0.0
+
+        if high >= targetPrice
+            targetTouched := true
+
+        if enableBreakeven and currentCallR >= breakevenActivationR
+            float callBreakEvenStop = entryPrice + initialRisk * 0.05
+            stopPrice := math.max(stopPrice, callBreakEvenStop)
+
+        if enableProfitLock and currentCallR >= profitLockActivationR
+            float callLockedProfitStop = entryPrice + initialRisk * profitLockR
+            stopPrice := math.max(stopPrice, callLockedProfitStop)
+
+        if enableTrailStop
+            float callTrailTrigger = entryPrice + initialRisk * liveTrailActivationR
+
+            if trailExtreme >= callTrailTrigger
+                trailActivated := true
+
+            if trailActivated
+                float callTrailDistance = trailPoints
+
+                if trailMethod == "ATR"
+                    callTrailDistance := atr * liveTrailATR
+                else if trailMethod == "Percent"
+                    callTrailDistance := trailExtreme * (trailPercent / 100.0)
+
+                float callChandelier = trailExtreme - callTrailDistance
+                float callEMAStop = ema15 - atr * runnerEMAATRBuffer
+                float callStructureTrail = runnerLowSeries - atr * runnerStructureATRBuffer
+                float callAdaptiveCandidate = callChandelier
+
+                if strongCallTrend
+                    callAdaptiveCandidate := math.min(callChandelier, math.min(callEMAStop, callStructureTrail))
+                else
+                    callAdaptiveCandidate := math.max(callChandelier, callEMAStop)
+
+                if na(trailStopPrice)
+                    trailStopPrice := math.max(stopPrice, callAdaptiveCandidate)
+                else
+                    trailStopPrice := math.max(trailStopPrice, callAdaptiveCandidate)
+
+                stopPrice := math.max(stopPrice, trailStopPrice)
+
+        if high >= targetPrice and (not allowTargetRunner or not strongCallTrend)
+            exitReason := "TARGET HIT"
+            actualExitPrice := targetPrice
+            label.new(x=time, y=targetPrice, text="CALL TARGET", xloc=xloc.bar_time, style=label.style_label_down, color=color.teal, textcolor=color.white)
+            tradeState := 0
+        else if callMomentumExit
+            exitReason := "MOMENTUM EXIT"
+            actualExitPrice := close
+            label.new(x=time, y=close, text="EXIT CALL\nMOMENTUM", xloc=xloc.bar_time, style=label.style_label_down, color=color.orange, textcolor=color.white)
+            tradeState := 0
+        else if callReversal
+            exitReason := "REVERSAL"
+            actualExitPrice := close
+            label.new(x=time, y=close, text="EXIT CALL\nREVERSAL", xloc=xloc.bar_time, style=label.style_label_down, color=color.orange, textcolor=color.white)
+            tradeState := 0
+
+//=============================================================================
+// PUT UNDERLYING EXIT / ADAPTIVE TRAIL
+//=============================================================================
+if barstate.isconfirmed and not (useStrictOptionPremiumExits and putOptionConfigured) and tradeState == -1 and not na(signalBar) and bar_index > signalBar
+    float putStopForThisBar = stopPrice
+
+    if high >= putStopForThisBar
+        exitReason := trailActivated ? "TRAIL STOP HIT" : "STOP HIT"
+        actualExitPrice := math.max(open, putStopForThisBar)
+        label.new(x=time, y=putStopForThisBar, text=trailActivated ? "PUT TRAIL SL" : "PUT SL", xloc=xloc.bar_time, style=label.style_label_up, color=color.red, textcolor=color.white)
+        tradeState := 0
+    else
+        if not tp1Touched and low <= entryPrice - initialRisk * effectiveTP1R
+            tp1Touched := true
+            tp1Event := true
+            label.new(bar_index, entryPrice + initialRisk * effectiveTP1R * -1, "PUT TP1 — TAKE PROFIT\n" + str.tostring(entryPrice + initialRisk * effectiveTP1R * -1, format.mintick), style=label.style_label_left, color=color.teal, textcolor=color.white, size=size.normal)
+            if not enableSandboxWebhook
+                alert("PUT TP1 | Profit-taking level touched", alert.freq_once_per_bar_close)
+        trailExtreme := na(trailExtreme) ? low : math.min(trailExtreme, low)
+        float currentPutR = initialRisk > 0 ? (entryPrice - trailExtreme) / initialRisk : 0.0
+
+        if low <= targetPrice
+            targetTouched := true
+
+        if enableBreakeven and currentPutR >= breakevenActivationR
+            float putBreakEvenStop = entryPrice - initialRisk * 0.05
+            stopPrice := math.min(stopPrice, putBreakEvenStop)
+
+        if enableProfitLock and currentPutR >= profitLockActivationR
+            float putLockedProfitStop = entryPrice - initialRisk * profitLockR
+            stopPrice := math.min(stopPrice, putLockedProfitStop)
+
+        if enableTrailStop
+            float putTrailTrigger = entryPrice - initialRisk * liveTrailActivationR
+
+            if trailExtreme <= putTrailTrigger
+                trailActivated := true
+
+            if trailActivated
+                float putTrailDistance = trailPoints
+
+                if trailMethod == "ATR"
+                    putTrailDistance := atr * liveTrailATR
+                else if trailMethod == "Percent"
+                    putTrailDistance := trailExtreme * (trailPercent / 100.0)
+
+                float putChandelier = trailExtreme + putTrailDistance
+                float putEMAStop = ema15 + atr * runnerEMAATRBuffer
+                float putStructureTrail = runnerHighSeries + atr * runnerStructureATRBuffer
+                float putAdaptiveCandidate = putChandelier
+
+                if strongPutTrend
+                    putAdaptiveCandidate := math.max(putChandelier, math.max(putEMAStop, putStructureTrail))
+                else
+                    putAdaptiveCandidate := math.min(putChandelier, putEMAStop)
+
+                if na(trailStopPrice)
+                    trailStopPrice := math.min(stopPrice, putAdaptiveCandidate)
+                else
+                    trailStopPrice := math.min(trailStopPrice, putAdaptiveCandidate)
+
+                stopPrice := math.min(stopPrice, trailStopPrice)
+
+        if low <= targetPrice and (not allowTargetRunner or not strongPutTrend)
+            exitReason := "TARGET HIT"
+            actualExitPrice := targetPrice
+            label.new(x=time, y=targetPrice, text="PUT TARGET", xloc=xloc.bar_time, style=label.style_label_up, color=color.teal, textcolor=color.white)
+            tradeState := 0
+        else if putMomentumExit
+            exitReason := "MOMENTUM EXIT"
+            actualExitPrice := close
+            label.new(x=time, y=close, text="EXIT PUT\nMOMENTUM", xloc=xloc.bar_time, style=label.style_label_up, color=color.orange, textcolor=color.white)
+            tradeState := 0
+        else if putReversal
+            exitReason := "REVERSAL"
+            actualExitPrice := close
+            label.new(x=time, y=close, text="EXIT PUT\nREVERSAL", xloc=xloc.bar_time, style=label.style_label_up, color=color.orange, textcolor=color.white)
+            tradeState := 0
+
+//=============================================================================
+// MANUAL EXIT
+//=============================================================================
+manualExitRequested = not autoTrackSignals and manualExitResponse == "YES" and manualExitPrice > 0 and not respondedToExit
+
+if barstate.islast and (tradeState == 1 or tradeState == -1) and manualExitRequested
+    bool wasCall = tradeState == 1
+    actualExitPrice := manualExitPrice
+    exitReason := "MANUAL EXIT"
+    respondedToExit := true
+    label.new(x=time, y=manualExitPrice, text=wasCall ? "CALL MANUAL EXIT" : "PUT MANUAL EXIT", xloc=xloc.bar_time, style=label.style_label_left, color=color.orange, textcolor=color.white)
+    tradeState := 0
+
+bool completedExitEvent = cycleStateBefore != 0 and tradeState == 0 and not na(entryPrice) and (not na(actualExitPrice) or not na(optionExitPremium))
+bool stopExitEvent = completedExitEvent and (exitReason == "STOP HIT" or exitReason == "TRAIL STOP HIT" or exitReason == "OPTION PREMIUM SL" or exitReason == "OPTION TRAIL EXIT")
+bool profitExitEvent = completedExitEvent and (exitReason == "TARGET HIT" or exitReason == "OPTION TARGET HIT")
+if completedExitEvent
+    if not enableSandboxWebhook
+        alert((cycleStateBefore > 0 ? "CALL" : "PUT") + " EXIT | " + exitReason + " | Underlying " + str.tostring(actualExitPrice, format.mintick), alert.freq_once_per_bar_close)
+if barstate.isconfirmed and completedExitEvent and barstate.isrealtime and enableSandboxWebhook and sandboxEntrySent
+    sandboxAction = stopExitEvent ? "EXIT_SL" : profitExitEvent ? "EXIT_TP" : "EXPIRE"
+    alert(f_sandbox_payload(sandboxTradeId, sandboxAction, sandboxSide, sandboxEntry, sandboxStop, sandboxTarget), alert.freq_once_per_bar_close)
+    sandboxEntrySent := false
+var int modeledCount = 0
+var int modeledWins = 0
+var float modeledNetR = 0.0
+if barstate.isconfirmed and completedExitEvent and not na(actualExitPrice) and initialRisk > 0 and not useStrictOptionPremiumExits
+    modeledR = (cycleStateBefore > 0 ? actualExitPrice - entryPrice : entryPrice - actualExitPrice) / initialRisk
+    modeledCount += 1
+    modeledWins += modeledR > 0 ? 1 : 0
+    modeledNetR += modeledR
+var table resultPanel = table.new(position.bottom_right, 2, 3, bgcolor=color.new(color.black, 10))
+if barstate.islast and showDashboard
+    table.cell(resultPanel, 0, 0, "MODELED SPY — NOT OPTION FILLS", text_color=color.white)
+    table.cell(resultPanel, 1, 0, "EXCLUDES SPREADS / FEES", text_color=color.orange)
+    table.cell(resultPanel, 0, 1, "Closed signals / positive", text_color=color.white)
+    table.cell(resultPanel, 1, 1, str.tostring(modeledCount) + " / " + str.tostring(modeledWins), text_color=color.white)
+    table.cell(resultPanel, 0, 2, "Modeled net R", text_color=color.white)
+    table.cell(resultPanel, 1, 2, str.tostring(modeledNetR, "#.##"), text_color=modeledNetR >= 0 ? color.lime : color.red)
+plotshape(stopExitEvent, title="STOP LOSS EXIT", text="SL EXIT", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
+plotshape(profitExitEvent, title="FINAL TAKE PROFIT", text="TP EXIT", style=shape.labelup, location=location.belowbar, color=color.teal, textcolor=color.white, size=size.normal)
+alertcondition(tp1Event, "TP1 TAKE PROFIT", "First profit-taking level touched; advisory signal only.")
+alertcondition(stopExitEvent, "STOP LOSS EXIT", "Stop-loss / trailing-stop exit detected.")
+alertcondition(profitExitEvent, "FINAL TAKE PROFIT", "Final profit target exit detected.")
+
+if cycleStateBefore != 0 and tradeState == 0
+    lastCycleEndBar := bar_index
+
+//=============================================================================
+// RETAIN COMPLETED ENTRY BOXES
+//=============================================================================
+frameShouldExist = (tradeState == 2 or tradeState == -2 or tradeState == 1 or tradeState == -1) and not na(signalTime)
+
+if not frameShouldExist and not na(rewardBox)
+    if not na(tradeLabel)
+        label.set_text(tradeLabel, label.get_text(tradeLabel) + "\nFINAL: " + exitReason)
+
+    if not na(centerSummary)
+        label.set_text(centerSummary, str.replace_all(label.get_text(centerSummary), "Open SPY PnL", "Last SPY PnL") + "\nFINAL: " + exitReason)
+
+    array.push(archivedReward, rewardBox)
+    array.push(archivedRisk, riskBox)
+    array.push(archivedEntry, entryLine)
+    array.push(archivedStop, stopLine)
+    array.push(archivedTarget, targetLine)
+    array.push(archivedTrade, tradeLabel)
+    array.push(archivedStopLabel, stopLabel)
+    array.push(archivedTargetLabel, targetLabel)
+    array.push(archivedCenter, centerSummary)
+
+    rewardBox := na
+    riskBox := na
+    entryLine := na
+    stopLine := na
+    targetLine := na
+    tradeLabel := na
+    stopLabel := na
+    targetLabel := na
+    centerSummary := na
+
+    int historyLimit = retainEntryBoxes ? retainedEntries : 0
+
+    while array.size(archivedReward) > historyLimit
+        box.delete(array.shift(archivedReward))
+        box.delete(array.shift(archivedRisk))
+        line.delete(array.shift(archivedEntry))
+        line.delete(array.shift(archivedStop))
+        line.delete(array.shift(archivedTarget))
+        label.delete(array.shift(archivedTrade))
+        label.delete(array.shift(archivedStopLabel))
+        label.delete(array.shift(archivedTargetLabel))
+        label.delete(array.shift(archivedCenter))
+
+//=============================================================================
+// AUTOMATIC ENTRY / TARGET / STOP BOX
+//=============================================================================
+int barMilliseconds = int(timeframe.in_seconds() * 1000)
+
+if frameShouldExist
+    int rightTime = time + barMilliseconds * boxBars
+    int infoLabelTime = rightTime + barMilliseconds * labelOffsetBars
+    bool isCallTrade = tradeState == 2 or tradeState == 1
+    bool isPendingTrade = tradeState == 2 or tradeState == -2
+
+    float rewardTop = isCallTrade ? targetPrice : entryPrice
+    float rewardBottom = isCallTrade ? entryPrice : targetPrice
+
+    if na(rewardBox)
+        rewardBox := box.new(left=signalTime, top=rewardTop, right=rightTime, bottom=rewardBottom, xloc=xloc.bar_time, border_color=color.teal, bgcolor=color.new(color.teal, 82))
+    else
+        box.set_left(rewardBox, signalTime)
+        box.set_right(rewardBox, rightTime)
+        box.set_top(rewardBox, rewardTop)
+        box.set_bottom(rewardBox, rewardBottom)
+
+    float riskTop = isCallTrade ? entryPrice : initialStopPrice
+    float riskBottom = isCallTrade ? initialStopPrice : entryPrice
+
+    if na(riskBox)
+        riskBox := box.new(left=signalTime, top=riskTop, right=rightTime, bottom=riskBottom, xloc=xloc.bar_time, border_color=color.red, bgcolor=color.new(color.red, 82))
+    else
+        box.set_left(riskBox, signalTime)
+        box.set_right(riskBox, rightTime)
+        box.set_top(riskBox, riskTop)
+        box.set_bottom(riskBox, riskBottom)
+
+    if na(entryLine)
+        entryLine := line.new(x1=signalTime, y1=entryPrice, x2=rightTime, y2=entryPrice, xloc=xloc.bar_time, color=color.gray, width=2)
+    else
+        line.set_xy1(entryLine, signalTime, entryPrice)
+        line.set_xy2(entryLine, rightTime, entryPrice)
+
+    if na(stopLine)
+        stopLine := line.new(x1=signalTime, y1=stopPrice, x2=rightTime, y2=stopPrice, xloc=xloc.bar_time, color=color.red, width=2)
+    else
+        line.set_xy1(stopLine, signalTime, stopPrice)
+        line.set_xy2(stopLine, rightTime, stopPrice)
+
+    if na(targetLine)
+        targetLine := line.new(x1=signalTime, y1=targetPrice, x2=rightTime, y2=targetPrice, xloc=xloc.bar_time, color=color.teal, width=2)
+    else
+        line.set_xy1(targetLine, signalTime, targetPrice)
+        line.set_xy2(targetLine, rightTime, targetPrice)
+
+    float pnlPoints = isCallTrade ? close - entryPrice : entryPrice - close
+    float riskPoints = initialRisk
+    float liveR = riskPoints > 0 ? pnlPoints / riskPoints : 0.0
+    int liveScore = isCallTrade ? callScore : putScore
+    int liveEdge = isCallTrade ? callEdge : putEdge
+    string optionSide = isCallTrade ? "C" : "P"
+    string directionText = isCallTrade ? "CALL SETUP — RESEARCH" : "PUT SETUP — RESEARCH"
+    string tradeStatus = isPendingTrade ? "DID YOU TAKE THIS ENTRY?" : isCallTrade ? "HOLD CALL" : "HOLD PUT"
+
+    string tradeText = directionText + "\nStrategy: " + lockedStrategy + "\nTP1: " + (useStrictOptionPremiumExits ? "PREMIUM MODE" : str.tostring(entryPrice + (isCallTrade ? 1 : -1) * initialRisk * effectiveTP1R, format.mintick) + (tp1Touched ? " TOUCHED" : " WAITING")) + "\n" + tradeStatus + "\nSPY Entry: " + str.tostring(entryPrice, format.mintick) + "\nSuggested: SPY " + str.tostring(suggestedStrike, "#") + optionSide + " " + expirationText + (enableSandboxWebhook ? " ATM (WORKER)" : " ITM (REFERENCE)") + "\nTarget basis: " + lockedTargetBasis + "\nTarget: " + str.tostring(targetPrice, format.mintick) + "\nInitial SL: " + str.tostring(initialStopPrice, format.mintick) + "\nCurrent SL: " + str.tostring(stopPrice, format.mintick) + "\nTrail: " + (trailActivated ? "ACTIVE" : "WAITING") + "\nMode: " + (veryStrongCallTrend or veryStrongPutTrend ? "VERY STRONG RUNNER" : strongCallTrend or strongPutTrend ? "STRONG RUNNER" : trailActivated ? "TRAIL ACTIVE" : "NORMAL") + "\nTarget Touched: " + (targetTouched ? "YES" : "NO") + "\nR:R 1:" + str.tostring(lockedRR, "#.##") + "\nEntry Score: " + str.tostring(lockedScore) + "/100" + "\nEntry Edge: +" + str.tostring(lockedEdge) + "\nLive Score: " + str.tostring(liveScore) + "/100" + "\nLive Edge: +" + str.tostring(liveEdge) + "\nGrade: " + lockedGrade + "\nPnL: " + str.tostring(pnlPoints, "#.##") + " pts" + "\nLive R: " + str.tostring(liveR, "#.##")
+
+    if useStrictOptionPremiumExits and not na(optionEntryPremium)
+        tradeText += "\nOption Entry: " + str.tostring(optionEntryPremium, "#.##") + "\nOption SL: " + str.tostring(optionStopPremium, "#.##") + "\nOption TP: " + str.tostring(optionTargetPremium, "#.##") + "\nContracts: " + str.tostring(optionContracts)
+
+    int middleTime = int(math.avg(signalTime, rightTime))
+    float targetDistance = math.abs(targetPrice - entryPrice)
+    float initialStopDistance = math.abs(entryPrice - initialStopPrice)
+
+    string compactText = "SPY " + str.tostring(suggestedStrike, "#.##") + optionSide + " " + expirationText + (enableSandboxWebhook ? " ATM (WORKER)" : " ITM (REFERENCE)") + "\nENTRY " + str.tostring(entryPrice, format.mintick) + "\nTP " + str.tostring(targetPrice, format.mintick) + " | SL " + str.tostring(stopPrice, format.mintick) + "\nR:R 1:" + str.tostring(lockedRR, "#.##") + " | Open SPY PnL " + str.tostring(pnlPoints, "#.##") + " pts\nScore " + str.tostring(lockedScore) + " | Grade " + lockedGrade
+
+    if showCenterSummary
+        if na(centerSummary)
+            centerSummary := label.new(x=middleTime, y=entryPrice, text=compactText, xloc=xloc.bar_time, style=label.style_label_center, color=pnlPoints >= 0 ? color.teal : color.red, textcolor=color.white, size=size.small)
+        else
+            label.set_xy(centerSummary, middleTime, entryPrice)
+            label.set_text(centerSummary, compactText)
+            label.set_color(centerSummary, pnlPoints >= 0 ? color.teal : color.red)
+
+    color tradeColor = isPendingTrade ? color.orange : pnlPoints >= 0 ? color.teal : color.red
+
+    if na(tradeLabel)
+        tradeLabel := label.new(x=infoLabelTime, y=entryPrice, text=tradeText, xloc=xloc.bar_time, style=label.style_label_left, color=tradeColor, textcolor=color.white)
+    else
+        label.set_xy(tradeLabel, infoLabelTime, entryPrice)
+        label.set_text(tradeLabel, tradeText)
+        label.set_color(tradeLabel, tradeColor)
+
+    string targetText = "SPY TP " + str.tostring(targetPrice, format.mintick) + "\nReward " + str.tostring(targetDistance, "#.##") + " pts | " + str.tostring(lockedRR, "#.##") + "R"
+
+    if na(targetLabel)
+        targetLabel := label.new(x=middleTime, y=targetPrice, text=targetText, xloc=xloc.bar_time, style=isCallTrade ? label.style_label_down : label.style_label_up, color=color.teal, textcolor=color.white)
+    else
+        label.set_xy(targetLabel, middleTime, targetPrice)
+        label.set_text(targetLabel, targetText)
+
+    string stopText = "CURRENT SPY SL " + str.tostring(stopPrice, format.mintick) + "\nInitial risk " + str.tostring(initialStopDistance, "#.##") + " pts"
+
+    if na(stopLabel)
+        stopLabel := label.new(x=middleTime, y=stopPrice, text=stopText, xloc=xloc.bar_time, style=isCallTrade ? label.style_label_up : label.style_label_down, color=color.red, textcolor=color.white)
+    else
+        label.set_xy(stopLabel, middleTime, stopPrice)
+        label.set_text(stopLabel, stopText)
+
+//=============================================================================
+// SIGNAL MARKERS
+//=============================================================================
+plotshape(callSetup, title="CALL ENTRY", style=shape.triangleup, location=location.belowbar, color=color.lime, text="CALL", textcolor=color.white, size=size.small)
+plotshape(putSetup, title="PUT ENTRY", style=shape.triangledown, location=location.abovebar, color=color.red, text="PUT", textcolor=color.white, size=size.small)
+
+//=============================================================================
+// ORIGINAL FULL DASHBOARD
+//=============================================================================
+var table dashboard = table.new(position.top_right, 2, 23, bgcolor=color.new(color.black, 10), frame_color=color.gray, border_width=1)
+
+string headerText = "SCANNING"
+color headerColor = color.orange
+
+if tradeState == 2
+    headerText := "CALL ENTRY FOUND"
+    headerColor := color.lime
+else if tradeState == -2
+    headerText := "PUT ENTRY FOUND"
+    headerColor := color.red
+else if tradeState == 1
+    headerText := "HOLD CALL"
+    headerColor := color.lime
+else if tradeState == -1
+    headerText := "HOLD PUT"
+    headerColor := color.red
+
+if barstate.islast and showDashboard
+    table.cell(dashboard, 0, 0, "STATUS", text_color=color.white, bgcolor=color.black)
+    table.cell(dashboard, 1, 0, tradeState == 0 ? amdStatus : headerText, text_color=headerColor, bgcolor=color.black)
+
+    table.cell(dashboard, 0, 20, "LIQUIDITY HIGH / LOW", text_color=color.white)
+    table.cell(dashboard, 1, 20, (na(amdBuyLevel) ? "--" : str.tostring(amdBuyLevel, format.mintick)) + " / " + (na(amdSellLevel) ? "--" : str.tostring(amdSellLevel, format.mintick)), text_color=color.aqua)
+    table.cell(dashboard, 0, 21, "LAST REJECTION", text_color=color.white)
+    table.cell(dashboard, 1, 21, lastRejectedSetup, text_color=color.orange)
+    table.cell(dashboard, 0, 22, "TARGET BASIS", text_color=color.white)
+    table.cell(dashboard, 1, 22, lockedTargetBasis == "" ? "WAIT QUALIFIED ENTRY" : lockedTargetBasis, text_color=color.aqua)
+
+    table.cell(dashboard, 0, 1, "CALL", text_color=color.white)
+    table.cell(dashboard, 1, 1, str.tostring(callScore) + " score " + callGrade, text_color=callQualified ? color.lime : color.gray)
+
+    table.cell(dashboard, 0, 2, "PUT", text_color=color.white)
+    table.cell(dashboard, 1, 2, str.tostring(putScore) + " score " + putGrade, text_color=putQualified ? color.red : color.gray)
+
+    string edgeText = "NEUTRAL"
+    color edgeColor = color.orange
+
+    if callEdge >= minimumEdge
+        edgeText := "CALL +" + str.tostring(callEdge)
+        edgeColor := color.lime
+    else if putEdge >= minimumEdge
+        edgeText := "PUT +" + str.tostring(putEdge)
+        edgeColor := color.red
+
+    table.cell(dashboard, 0, 3, "EDGE", text_color=color.white)
+    table.cell(dashboard, 1, 3, edgeText, text_color=edgeColor)
+
+    string hullText = hullBull ? "BULL" : hullBear ? "BEAR" : "FLAT"
+    color hullColor = hullBull ? color.lime : hullBear ? color.red : color.orange
+    table.cell(dashboard, 0, 4, "HULL", text_color=color.white)
+    table.cell(dashboard, 1, 4, hullText, text_color=hullColor)
+
+    table.cell(dashboard, 0, 5, "VWAP", text_color=color.white)
+    table.cell(dashboard, 1, 5, aboveVWAP ? "ABOVE" : "BELOW", text_color=aboveVWAP ? color.lime : color.red)
+
+    string midText = midBull ? "BULL" : midBear ? "BEAR" : "MIXED"
+    color midColor = midBull ? color.lime : midBear ? color.red : color.orange
+    table.cell(dashboard, 0, 6, "15M", text_color=color.white)
+    table.cell(dashboard, 1, 6, midText, text_color=midColor)
+
+    string majorText = majorBull ? "BULL" : majorBear ? "BEAR" : "MIXED"
+    color majorColor = majorBull ? color.lime : majorBear ? color.red : color.orange
+    table.cell(dashboard, 0, 7, "60M", text_color=color.white)
+    table.cell(dashboard, 1, 7, majorText, text_color=majorColor)
+
+    string macdText = macdBull ? "BULL" : macdBear ? "BEAR" : "MIXED"
+    color macdColor = macdBull ? color.lime : macdBear ? color.red : color.orange
+    table.cell(dashboard, 0, 8, "MACD", text_color=color.white)
+    table.cell(dashboard, 1, 8, macdText, text_color=macdColor)
+
+    color rsiColor = rsiValue >= 52 ? color.lime : rsiValue <= 48 ? color.red : color.orange
+    table.cell(dashboard, 0, 9, "RSI", text_color=color.white)
+    table.cell(dashboard, 1, 9, str.tostring(rsiValue, "#.0"), text_color=rsiColor)
+
+    table.cell(dashboard, 0, 10, "ADX", text_color=color.white)
+    table.cell(dashboard, 1, 10, str.tostring(adx, "#.0"), text_color=adxStrong ? color.lime : color.orange)
+
+    table.cell(dashboard, 0, 11, "RVOL", text_color=color.white)
+    table.cell(dashboard, 1, 11, str.tostring(rvol, "#.00"), text_color=rvolOK ? color.lime : color.orange)
+
+    string entryInfo = "—"
+    if tradeState != 0 and not na(entryPrice)
+        entryInfo := str.tostring(entryPrice, format.mintick) + " | " + str.tostring(suggestedStrike, "#") + (tradeState > 0 ? "C" : "P")
+
+    table.cell(dashboard, 0, 12, "ENTRY / ITM", text_color=color.white)
+    table.cell(dashboard, 1, 12, entryInfo, text_color=color.yellow)
+
+    color responseColor = enteredResponse == "YES" ? color.lime : enteredResponse == "NO" ? color.red : color.orange
+    table.cell(dashboard, 0, 13, "ENTERED?", text_color=color.white)
+    table.cell(dashboard, 1, 13, autoTrackSignals ? "AUTO TRACKING" : enteredResponse, text_color=autoTrackSignals ? color.aqua : responseColor)
+
+    string trailDashboardText = "—"
+    color trailDashboardColor = color.gray
+
+    if tradeState == 1 or tradeState == -1
+        if trailActivated
+            trailDashboardText := str.tostring(stopPrice, format.mintick) + " ACTIVE"
+            trailDashboardColor := color.yellow
+        else
+            trailDashboardText := "WAITING"
+            trailDashboardColor := color.orange
+
+    table.cell(dashboard, 0, 14, "TRAIL SL", text_color=color.white)
+    table.cell(dashboard, 1, 14, trailDashboardText, text_color=trailDashboardColor)
+
+    string tradeModeText = "NORMAL"
+    color tradeModeColor = color.gray
+
+    if veryStrongCallTrend or veryStrongPutTrend
+        tradeModeText := "VERY STRONG RUNNER"
+        tradeModeColor := color.lime
+    else if strongCallTrend or strongPutTrend
+        tradeModeText := "STRONG RUNNER"
+        tradeModeColor := color.lime
+    else if trailActivated
+        tradeModeText := "TRAIL ACTIVE"
+        tradeModeColor := color.yellow
+
+    table.cell(dashboard, 0, 15, "MODE", text_color=color.white)
+    table.cell(dashboard, 1, 15, tradeModeText, text_color=tradeModeColor)
+
+    table.cell(dashboard, 0, 16, "OPT ENTRY", text_color=color.white)
+    table.cell(dashboard, 1, 16, na(optionEntryPremium) ? "—" : str.tostring(optionEntryPremium, "#.##"), text_color=color.white)
+
+    table.cell(dashboard, 0, 17, "OPT SL", text_color=color.white)
+    table.cell(dashboard, 1, 17, na(optionStopPremium) ? "—" : str.tostring(optionStopPremium, "#.##"), text_color=color.red)
+
+    table.cell(dashboard, 0, 18, "OPT TP", text_color=color.white)
+    table.cell(dashboard, 1, 18, na(optionTargetPremium) ? "—" : str.tostring(optionTargetPremium, "#.##"), text_color=color.lime)
+
+    table.cell(dashboard, 0, 19, "LAST EXIT", text_color=color.white)
+    table.cell(dashboard, 1, 19, exitReason == "" ? "—" : exitReason, text_color=color.white)
+
+//=============================================================================
+// INDICATOR PLOTS AND TRAILING BAND
+//=============================================================================
+plot(showEMA ? ema10 : na, "EMA 10", color=color.aqua, linewidth=2)
+plot(showEMA ? ema15 : na, "EMA 15", color=color.orange, linewidth=2)
+plot(showEMA ? ema22 : na, "EMA 22", color=color.fuchsia, linewidth=2)
+plot(showHull ? hull : na, "Hull", color=hullBull ? color.lime : color.red, linewidth=3)
+plot(showVWAP ? vwapValue : na, "VWAP", color=color.purple, linewidth=2)
+
+float trailBandCenter = na
+if showTrailBand and enableTrailStop and trailActivated and (tradeState == 1 or tradeState == -1)
+    trailBandCenter := stopPrice
+
+float trailBandHalfWidth = atr * trailBandATRWidth
+float trailBandUpper = na
+float trailBandLower = na
+
+if not na(trailBandCenter)
+    trailBandUpper := trailBandCenter + trailBandHalfWidth
+    trailBandLower := trailBandCenter - trailBandHalfWidth
+
+trailUpperPlot = plot(trailBandUpper, "Trail SL Band Upper", color=color.new(color.yellow, 35), linewidth=1)
+trailLowerPlot = plot(trailBandLower, "Trail SL Band Lower", color=color.new(color.yellow, 35), linewidth=1)
+plot(trailBandCenter, "Trailing Stop", color=color.yellow, linewidth=2, style=plot.style_linebr)
+fill(trailUpperPlot, trailLowerPlot, color=color.new(color.yellow, 85), title="Trail Stop Loss Band")
+
+//=============================================================================
+// ORDERFLOW OBJECT HELPERS
+//=============================================================================
+var array<box> orderflowBoxes = array.new<box>()
+var array<label> orderflowLabels = array.new<label>()
+
+f_clear_old_orderflow(array<box> bx, array<label> lb, int maxBoxes, int maxLabels) =>
+    while array.size(bx) > maxBoxes
+        box oldBox = array.shift(bx)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+    while array.size(lb) > maxLabels
+        label oldLabel = array.shift(lb)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+f_delete_all_orderflow(array<box> bx, array<label> lb) =>
+    while array.size(bx) > 0
+        box oldBox = array.shift(bx)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+    while array.size(lb) > 0
+        label oldLabel = array.shift(lb)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+f_clear_live_orderflow(array<box> bx, array<label> lb) =>
+    while array.size(bx) > 0
+        box oldBox = array.shift(bx)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+    while array.size(lb) > 0
+        label oldLabel = array.shift(lb)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+
+//=============================================================================
+// ORIGINAL OHLCV ORDERFLOW ESTIMATE
+//=============================================================================
+float ofRange = math.max(high - low, syminfo.mintick)
+float ofCloseLocation = (close - low) / ofRange
+float ofBodyBias = (close - open) / ofRange
+float ofBuyShareBase = ofCloseLocation + ofBodyBias * orderflowDominanceBoost
+ofBuyShareBase := math.max(0.08, math.min(0.92, ofBuyShareBase))
+float ofSellShareBase = 1.0 - ofBuyShareBase
+
+int ofBarMs = int(timeframe.in_seconds() * 1000)
+int ofOuterWidthMs = int(ofBarMs * orderflowWidthPct / 100.0)
+int ofCenterGapMs = int(ofBarMs * orderflowGapPct / 100.0)
+int ofCandleHalfMs = orderflowShowCandleCenter ? int(ofBarMs * 0.08) : ofCenterGapMs
+int ofLeftOuter = time - ofOuterWidthMs
+int ofLeftInner = time - math.max(ofCenterGapMs, ofCandleHalfMs)
+int ofRightInner = time + math.max(ofCenterGapMs, ofCandleHalfMs)
+int ofRightOuter = time + ofOuterWidthMs
+
+//=============================================================================
+// CONFIRMED CANDLE FOOTPRINT
+//=============================================================================
+if showOrderflow and barstate.isconfirmed
+    float rowHeight = ofRange / orderflowRows
+
+    for row = 0 to orderflowRows - 1
+        float rowLow = low + rowHeight * row
+        float rowHigh = row == orderflowRows - 1 ? high : rowLow + rowHeight
+        float rowMid = math.avg(rowLow, rowHigh)
+        float normalizedPos = (rowMid - low) / ofRange
+        float distanceFromClose = math.abs(normalizedPos - ofCloseLocation)
+        float participation = math.max(0.12, 1.0 - distanceFromClose * 1.25)
+        float bodyLow = math.min(open, close)
+        float bodyHigh = math.max(open, close)
+
+        if rowMid >= bodyLow and rowMid <= bodyHigh
+            participation *= 1.35
+
+        float rowTotal = volume * participation / orderflowRows
+        float rowDirectionalSkew = (normalizedPos - 0.50) * ofBodyBias * 0.75
+        float rowBuyShare = ofBuyShareBase + rowDirectionalSkew
+        rowBuyShare := math.max(0.05, math.min(0.95, rowBuyShare))
+
+        float rowSellShare = 1.0 - rowBuyShare
+        float rowBuyVol = rowTotal * rowBuyShare
+        float rowSellVol = rowTotal * rowSellShare
+        bool strongBuy = rowBuyShare >= orderflowStrongThreshold
+        bool strongSell = rowSellShare >= orderflowStrongThreshold
+        bool buyDominant = rowBuyVol >= rowSellVol * orderflowDominanceRatio
+        bool sellDominant = rowSellVol >= rowBuyVol * orderflowDominanceRatio
+
+        color sellCellColor = orderflowClassicTapeStyle ? color.rgb(244, 120, 120) : color.rgb(235, 45, 65)
+        color buyCellColor = orderflowClassicTapeStyle ? color.rgb(113, 214, 190) : color.rgb(0, 205, 135)
+
+        if orderflowDirectionalOnly
+            if rowBuyShare > rowSellShare
+                sellCellColor := color.new(orderflowClassicTapeStyle ? color.rgb(244, 120, 120) : color.rgb(235, 45, 65), 78)
+                buyCellColor := strongBuy ? color.rgb(78, 198, 172) : color.rgb(113, 214, 190)
+            else if rowSellShare > rowBuyShare
+                buyCellColor := color.new(orderflowClassicTapeStyle ? color.rgb(113, 214, 190) : color.rgb(0, 205, 135), 78)
+                sellCellColor := strongSell ? color.rgb(229, 92, 92) : color.rgb(244, 120, 120)
+
+        if orderflowBlackDominance and sellDominant
+            sellCellColor := color.black
+        if orderflowBlackDominance and buyDominant
+            buyCellColor := color.black
+
+        box sellBox = box.new(left=ofLeftOuter, top=rowHigh, right=ofLeftInner, bottom=rowLow, xloc=xloc.bar_time, border_color=color.new(color.white, 92), border_width=1, bgcolor=sellCellColor)
+        box buyBox = box.new(left=ofRightInner, top=rowHigh, right=ofRightOuter, bottom=rowLow, xloc=xloc.bar_time, border_color=color.new(color.white, 92), border_width=1, bgcolor=buyCellColor)
+        array.push(orderflowBoxes, sellBox)
+        array.push(orderflowBoxes, buyBox)
+
+        if orderflowShowNumbers
+            color sellNumberColor = orderflowBlackDominance and sellDominant ? color.rgb(255, 95, 115) : color.red
+            color buyNumberColor = orderflowBlackDominance and buyDominant ? color.lime : color.green
+
+            label sellLabel = label.new(x=int(math.avg(ofLeftOuter, ofLeftInner)), y=rowMid, text=str.tostring(rowSellVol, format.volume), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=sellNumberColor, size=(orderflowTextSize == "Small" ? size.small : size.tiny), textalign=text.align_center)
+            label buyLabel = label.new(x=int(math.avg(ofRightInner, ofRightOuter)), y=rowMid, text=str.tostring(rowBuyVol, format.volume), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=buyNumberColor, size=(orderflowTextSize == "Small" ? size.small : size.tiny), textalign=text.align_center)
+            array.push(orderflowLabels, sellLabel)
+            array.push(orderflowLabels, buyLabel)
+
+    float candleBuyVol = volume * ofBuyShareBase
+    float candleSellVol = volume * ofSellShareBase
+    float candleDelta = candleBuyVol - candleSellVol
+    bool candleBullFlow = candleDelta >= 0
+
+    if orderflowShowDelta
+        string deltaText = "EST Δ " + (candleDelta > 0 ? "+" : "") + str.tostring(candleDelta, format.volume)
+        label deltaLabel = label.new(x=time, y=low - atr * 0.10, text=deltaText, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=candleBullFlow ? color.lime : color.red, size=size.tiny, textalign=text.align_center)
+        array.push(orderflowLabels, deltaLabel)
+
+    if orderflowShowDirectionTag
+        string estimatedDirectionText = candleBullFlow ? "EST BUY" : "EST SELL"
+        color estimatedDirectionColor = candleBullFlow ? color.rgb(0, 220, 145) : color.rgb(245, 35, 55)
+        label estimatedDirectionLabel = label.new(x=time, y=high + atr * 0.08, text=estimatedDirectionText, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_down, color=estimatedDirectionColor, textcolor=color.white, size=(orderflowTextSize == "Small" ? size.small : size.tiny))
+        array.push(orderflowLabels, estimatedDirectionLabel)
+
+    int maxBoxesAllowed = math.min(200, orderflowBarsToShow * orderflowRows * 2)
+    int maxLabelsAllowed = math.min(200, orderflowBarsToShow * (orderflowRows * 2 + 2))
+    f_clear_old_orderflow(orderflowBoxes, orderflowLabels, maxBoxesAllowed, maxLabelsAllowed)
+
+//=============================================================================
+// LIVE CANDLE FOOTPRINT
+//=============================================================================
+var array<box> liveOrderflowBoxes = array.new<box>()
+var array<label> liveOrderflowLabels = array.new<label>()
+
+if showOrderflow and orderflowLiveTracking and barstate.isrealtime
+    f_clear_live_orderflow(liveOrderflowBoxes, liveOrderflowLabels)
+    float liveRowHeight = ofRange / orderflowRows
+
+    for liveRow = 0 to orderflowRows - 1
+        float liveRowLow = low + liveRowHeight * liveRow
+        float liveRowHigh = liveRow == orderflowRows - 1 ? high : liveRowLow + liveRowHeight
+        float liveRowMid = math.avg(liveRowLow, liveRowHigh)
+        float liveNormalizedPos = (liveRowMid - low) / ofRange
+        float liveDistanceFromClose = math.abs(liveNormalizedPos - ofCloseLocation)
+        float liveParticipation = math.max(0.12, 1.0 - liveDistanceFromClose * 1.25)
+        float liveBodyLow = math.min(open, close)
+        float liveBodyHigh = math.max(open, close)
+
+        if liveRowMid >= liveBodyLow and liveRowMid <= liveBodyHigh
+            liveParticipation *= 1.35
+
+        float liveRowTotal = volume * liveParticipation / orderflowRows
+        float liveDirectionalSkew = (liveNormalizedPos - 0.50) * ofBodyBias * 0.75
+        float liveBuyShare = ofBuyShareBase + liveDirectionalSkew
+        liveBuyShare := math.max(0.05, math.min(0.95, liveBuyShare))
+
+        float liveSellShare = 1.0 - liveBuyShare
+        float liveBuyVol = liveRowTotal * liveBuyShare
+        float liveSellVol = liveRowTotal * liveSellShare
+        bool liveStrongBuy = liveBuyShare >= orderflowStrongThreshold
+        bool liveStrongSell = liveSellShare >= orderflowStrongThreshold
+        bool liveBuyDominant = liveBuyVol >= liveSellVol * orderflowDominanceRatio
+        bool liveSellDominant = liveSellVol >= liveBuyVol * orderflowDominanceRatio
+
+        color liveSellColor = orderflowClassicTapeStyle ? color.rgb(244, 120, 120) : color.rgb(235, 45, 65)
+        color liveBuyColor = orderflowClassicTapeStyle ? color.rgb(113, 214, 190) : color.rgb(0, 205, 135)
+
+        if orderflowDirectionalOnly
+            if liveBuyShare > liveSellShare
+                liveSellColor := color.new(orderflowClassicTapeStyle ? color.rgb(244, 120, 120) : color.rgb(235, 45, 65), 78)
+                liveBuyColor := liveStrongBuy ? color.rgb(78, 198, 172) : color.rgb(113, 214, 190)
+            else if liveSellShare > liveBuyShare
+                liveBuyColor := color.new(orderflowClassicTapeStyle ? color.rgb(113, 214, 190) : color.rgb(0, 205, 135), 78)
+                liveSellColor := liveStrongSell ? color.rgb(229, 92, 92) : color.rgb(244, 120, 120)
+
+        if orderflowBlackDominance and liveSellDominant
+            liveSellColor := color.black
+        if orderflowBlackDominance and liveBuyDominant
+            liveBuyColor := color.black
+
+        box liveSellBox = box.new(left=ofLeftOuter, top=liveRowHigh, right=ofLeftInner, bottom=liveRowLow, xloc=xloc.bar_time, border_color=color.new(color.white, 92), border_width=1, bgcolor=liveSellColor)
+        box liveBuyBox = box.new(left=ofRightInner, top=liveRowHigh, right=ofRightOuter, bottom=liveRowLow, xloc=xloc.bar_time, border_color=color.new(color.white, 92), border_width=1, bgcolor=liveBuyColor)
+        array.push(liveOrderflowBoxes, liveSellBox)
+        array.push(liveOrderflowBoxes, liveBuyBox)
+
+        if orderflowShowNumbers
+            color liveSellNumberColor = orderflowBlackDominance and liveSellDominant ? color.rgb(255, 95, 115) : color.red
+            color liveBuyNumberColor = orderflowBlackDominance and liveBuyDominant ? color.lime : color.green
+
+            label liveSellLabel = label.new(x=int(math.avg(ofLeftOuter, ofLeftInner)), y=liveRowMid, text=str.tostring(liveSellVol, format.volume), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=liveSellNumberColor, size=(orderflowTextSize == "Small" ? size.small : size.tiny), textalign=text.align_center)
+            label liveBuyLabel = label.new(x=int(math.avg(ofRightInner, ofRightOuter)), y=liveRowMid, text=str.tostring(liveBuyVol, format.volume), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=liveBuyNumberColor, size=(orderflowTextSize == "Small" ? size.small : size.tiny), textalign=text.align_center)
+            array.push(liveOrderflowLabels, liveSellLabel)
+            array.push(liveOrderflowLabels, liveBuyLabel)
+
+    float liveCandleBuyVol = volume * ofBuyShareBase
+    float liveCandleSellVol = volume * ofSellShareBase
+    float liveCandleDelta = liveCandleBuyVol - liveCandleSellVol
+    bool liveBullFlow = liveCandleDelta >= 0
+
+    if orderflowShowDelta
+        string liveDeltaText = "LIVE Δ " + (liveCandleDelta > 0 ? "+" : "") + str.tostring(liveCandleDelta, format.volume)
+        label liveDeltaLabel = label.new(x=time, y=low - atr * 0.10, text=liveDeltaText, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_none, textcolor=liveBullFlow ? color.lime : color.red, size=(orderflowTextSize == "Small" ? size.small : size.tiny), textalign=text.align_center)
+        array.push(liveOrderflowLabels, liveDeltaLabel)
+
+    if orderflowShowDirectionTag
+        string liveDirectionText = liveBullFlow ? "EST BUY" : "EST SELL"
+        color liveDirectionColor = liveBullFlow ? color.rgb(0, 220, 145) : color.rgb(245, 35, 55)
+        label liveDirectionLabel = label.new(x=time, y=high + atr * 0.10, text=liveDirectionText, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_down, color=liveDirectionColor, textcolor=color.white, size=(orderflowTextSize == "Small" ? size.small : size.tiny))
+        array.push(liveOrderflowLabels, liveDirectionLabel)
+else
+    f_clear_live_orderflow(liveOrderflowBoxes, liveOrderflowLabels)
+
+if not showOrderflow
+    f_delete_all_orderflow(orderflowBoxes, orderflowLabels)
+    f_clear_live_orderflow(liveOrderflowBoxes, liveOrderflowLabels)
+
+//=============================================================================
+// OPTION CONFIGURATION NOTICE
+//=============================================================================
+var label optionConfigWarning = na
+bool optionConfigMissing = useStrictOptionPremiumExits and (not callOptionConfigured or not putOptionConfigured)
+
+if barstate.islast
+    if optionConfigMissing
+        if na(optionConfigWarning)
+            optionConfigWarning := label.new(x=time, y=high + atr * 0.50, text="STRICT OPTION EXIT NOT READY\nSelect exact CALL + PUT option symbols in Settings", xloc=xloc.bar_time, style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+        else
+            label.set_x(optionConfigWarning, time)
+            label.set_y(optionConfigWarning, high + atr * 0.50)
+    else if not na(optionConfigWarning)
+        label.delete(optionConfigWarning)
+        optionConfigWarning := na
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+alertcondition(completedExitEvent and exitReason == "OPTION PREMIUM SL", title="OPTION PREMIUM STOP", message="Option premium stop was hit.")
+alertcondition(completedExitEvent and exitReason == "OPTION TARGET HIT", title="OPTION PREMIUM TARGET", message="Option premium target was hit.")
+alertcondition(completedExitEvent and exitReason == "OPTION TRAIL EXIT", title="OPTION PREMIUM TRAIL EXIT", message="Option premium trailing exit was hit.")
+alertcondition(hardExitEvent, title="SPY 2PM HARD EXIT", message="SPY options engine reached its hard-exit cutoff.")
+alertcondition(callSetup, title="SPY CALL ENTRY", message="SPY CALL entry detected. Entry/TP/SL box generated.")
+alertcondition(putSetup, title="SPY PUT ENTRY", message="SPY PUT entry detected. Entry/TP/SL box generated.")
+alertcondition(callReversal, title="SPY CALL REVERSAL", message="SPY CALL reversal conditions detected.")
+alertcondition(putReversal, title="SPY PUT REVERSAL", message="SPY PUT reversal conditions detected.")
+alertcondition(callMomentumExit, title="SPY CALL MOMENTUM EXIT", message="SPY CALL momentum deterioration exit detected.")
+alertcondition(putMomentumExit, title="SPY PUT MOMENTUM EXIT", message="SPY PUT momentum deterioration exit detected.")
+alertcondition(strongCallTrend and (not allowTargetRunner or not strongCallTrend)[1], title="SPY CALL STRONG RUNNER", message="SPY CALL entered strong-runner mode. Adaptive trailing manages the runner.")
+alertcondition(strongPutTrend and (not allowTargetRunner or not strongPutTrend)[1], title="SPY PUT STRONG RUNNER", message="SPY PUT entered strong-runner mode. Adaptive trailing manages the runner.")
