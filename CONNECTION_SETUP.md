@@ -8,6 +8,10 @@ This remains close-confirmed: a touch is not proof of a broker limit fill, and
 the worker buys the option at a fresh quoted ask, not at the SPY reference price.
 SPY levels are not option premiums. There is no established profitable edge.
 
+Paper ENTRY alerts must identify `source_version: sweep_retest_v1`; older
+indicator messages are rejected. This identifies the configured alert format,
+not cryptographic proof that the strategy rules were evaluated correctly.
+
 The new source remains uncompiled in TradingView. Default real-order-flow data
 gating remains intact, and sandbox alerts default off. No synthetic order flow
 is introduced. Before enabling it, connect verified external sources or explicitly

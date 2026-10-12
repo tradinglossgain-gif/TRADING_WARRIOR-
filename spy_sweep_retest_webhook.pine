@@ -10,7 +10,7 @@ jsonEscape(string value) =>
     str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\"")
 webhookPayload(string id, string action, int side, float entry, float stop, float target) =>
     stamp = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
-    "{\"token\":\"" + jsonEscape(webhookToken) + "\",\"trade_id\":\"" + id + "\",\"action\":\"" + action + "\",\"timestamp\":\"" + stamp + "\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(stop, format.mintick) + ",\"target\":" + str.tostring(target, format.mintick) + "}"
+    "{\"token\":\"" + jsonEscape(webhookToken) + "\",\"trade_id\":\"" + id + "\",\"action\":\"" + action + "\",\"timestamp\":\"" + stamp + "\",\"source_version\":\"sweep_retest_v1\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(stop, format.mintick) + ",\"target\":" + str.tostring(target, format.mintick) + "}"
 
 groupFlow = "Order-flow data — entries blocked by default"
 mode = input.string("Require verified external order flow", "Mode", options=["Require verified external order flow", "Price-action-only research"], group=groupFlow)

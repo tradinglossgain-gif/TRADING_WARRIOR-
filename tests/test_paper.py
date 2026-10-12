@@ -161,9 +161,11 @@ def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_pa
     now = [datetime(2026, 10, 12, 14, 0, tzinfo=timezone.utc)]
     settings = Settings("x" * 40, str(tmp_path / "db"), str(tmp_path / "PAUSED"), paper_enabled=True)
     fake = FakeBroker()
-    payload = {"token": settings.token, "trade_id": "trade-1", "timestamp": now[0].isoformat(),
+    payload = {"token": settings.token, "source_version": "sweep_retest_v1", "trade_id": "trade-1", "timestamp": now[0].isoformat(),
                "symbol": "SPY", "direction": "CALL", "entry": 778.62, "stop": 777, "target": 782}
     with TestClient(create_app(settings, lambda: now[0], fake)) as client:
+        legacy = {key: value for key, value in payload.items() if key != "source_version"}
+        assert client.post("/webhook", json=legacy).status_code == 422
         assert client.post("/webhook", json=payload).json()["status"] == "queued"
         assert client.post("/webhook", json=payload).json()["status"] == "duplicate"
         with sqlite3.connect(settings.database) as db:

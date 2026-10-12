@@ -23,6 +23,7 @@ class Alert(BaseModel):
     token: str = Field(min_length=32, max_length=256)
     trade_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")
     action: Literal["ENTRY", "EXIT_SL", "EXIT_TP", "EXPIRE"] = "ENTRY"
+    source_version: Literal["sweep_retest_v1"] | None = None
     timestamp: datetime
     symbol: Literal["SPY"]
     direction: Literal["CALL", "PUT"]
@@ -184,7 +185,7 @@ def create_app(settings: Settings, clock=None, broker=None):
             raise HTTPException(422, "Alert is stale or from the future")
         if Path(settings.kill_file).exists():
             raise HTTPException(503, "Receiver paused")
-        payload = alert.model_dump(mode="json", exclude={"token"})
+        payload = alert.model_dump(mode="json", exclude={"token"}, exclude_none=True)
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
         event_id = f"{alert.trade_id}:{alert.action}"
@@ -202,6 +203,8 @@ def create_app(settings: Settings, clock=None, broker=None):
             if alert.action == "ENTRY":
                 if settings.paper_enabled and (worker is None or not worker.thread or not worker.thread.is_alive()):
                     raise HTTPException(503, "Paper worker unavailable; inspect /health paper_startup_error")
+                if settings.paper_enabled and alert.source_version != "sweep_retest_v1":
+                    raise HTTPException(422, "Paper entries require the latest sweep/retest JSON script")
                 hhmm = local.hour * 100 + local.minute
                 if local.weekday() >= 5 or not 945 <= hhmm < 1530:
                     raise HTTPException(422, "Entries allowed weekdays 09:45–15:30 New York")
