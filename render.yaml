@@ -20,7 +20,9 @@ services:
       - key: KILL_SWITCH_FILE
         value: /var/data/PAUSED
       - key: PAPER_TRADING_ENABLED
-        value: "false"
+        value: "true"
+      - key: PAPER_QUANTITY
+        value: "5"
       - key: WEBULL_ACCOUNT_NUMBER
         sync: false
       - key: PAPER_PREMIUM_CAP
