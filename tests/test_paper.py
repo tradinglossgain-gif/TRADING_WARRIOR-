@@ -20,12 +20,12 @@ class FakeBroker:
     def prepare(self, payload, client_id, now):
         return {**atm_contract(payload, now), "limit": "1.36"}
 
-    def place(self, contract, client_id, side):
-        self.placements.append((contract, client_id, side))
+    def place(self, contract, client_id, side, quantity=1):
+        self.placements.append((contract, client_id, side, quantity))
         if self.fail_after_place:
             raise TimeoutError("secret SDK exception must not be stored")
 
-    def detail(self, client_id, side):
+    def detail(self, client_id, side, quantity=1):
         return self.status
 
     def cancel(self, client_id):
@@ -59,8 +59,21 @@ def test_atm_0dte_and_close_intent(worker):
     order = order_payload(c, "id", "SELL")
     assert order["position_intent"] == "SELL_TO_CLOSE" and order["quantity"] == "1"
     assert "limit_price" not in order
+    five_lot = order_payload(c, "id-5", "BUY", "1.36", quantity=5)
+    assert five_lot["quantity"] == five_lot["legs"][0]["quantity"] == "5"
     with pytest.raises(BrokerError):
         atm_contract(payload, now[0] + timedelta(days=1))
+
+
+def test_paper_quantity_configuration_is_bounded(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_TOKEN", "x" * 40)
+    monkeypatch.delenv("WEBHOOK_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("PAPER_TRADING_ENABLED", "false")
+    monkeypatch.setenv("PAPER_QUANTITY", "5")
+    assert Settings.from_env().paper_quantity == 5
+    monkeypatch.setenv("PAPER_QUANTITY", "6")
+    with pytest.raises(RuntimeError, match="PAPER_QUANTITY"):
+        Settings.from_env()
 
 
 def test_duplicate_worker_ticks_never_duplicate_buy_and_exit_uses_same_contract(worker):
@@ -70,7 +83,7 @@ def test_duplicate_worker_ticks_never_duplicate_buy_and_exit_uses_same_contract(
     for _ in range(3):
         w.tick()
     assert len(fake.placements) == 1 and row(w)["state"] == "BUY_PENDING"
-    fake.status = ("FILLED", 1)
+    fake.status = ("FILLED", 5)
     w.tick()
     w.update(payload["trade_id"], exit_requested=1)
     w.tick()
@@ -111,7 +124,7 @@ def test_unfilled_order_is_cancelled_then_fill_race_is_reconciled(worker):
     w.tick()
     assert fake.cancellations and row(w)["state"] == "BUY_CANCELLING"
     w.update(payload["trade_id"], exit_requested=1)
-    fake.status = ("FILLED", 1)
+    fake.status = ("FILLED", 5)
     w.tick()
     w.tick()
     assert len(fake.placements) == 2 and fake.placements[-1][2] == "SELL"
@@ -121,11 +134,47 @@ def test_server_cutoff_closes_filled_trade_without_exit_alert(worker):
     w, fake, now, payload = worker
     w.tick()
     w.tick()
-    fake.status = ("FILLED", 1)
+    fake.status = ("FILLED", 5)
     w.tick()
     now[0] = now[0].replace(hour=18)  # 14:00 New York
     w.tick()
     assert fake.placements[-1][2] == "SELL"
+
+
+def test_partial_entry_is_cancelled_and_only_filled_quantity_is_closed(worker):
+    w, fake, now, payload = worker
+    w.tick()
+    w.tick()
+    fake.status = ("PARTIAL_FILLED", 2)
+    now[0] += timedelta(seconds=61)
+    w.tick()
+    assert fake.cancellations and row(w)["state"] == "BUY_CANCELLING"
+    fake.status = ("CANCELLED", 2)
+    w.tick()
+    assert row(w)["state"] == "FILLED" and row(w)["filled_quantity"] == 2
+    w.update(payload["trade_id"], exit_requested=1)
+    w.tick()
+    assert fake.placements[-1][2:] == ("SELL", 2)
+    fake.status = ("FILLED", 2)
+    w.tick()
+    assert row(w)["state"] == "CLOSED"
+
+
+def test_partial_exit_is_cancelled_and_requires_reconciliation(worker):
+    w, fake, now, payload = worker
+    w.tick()
+    w.tick()
+    fake.status = ("FILLED", 5)
+    w.tick()
+    w.update(payload["trade_id"], exit_requested=1)
+    w.tick()
+    fake.status = ("PARTIAL_FILLED", 2)
+    w.tick()
+    assert fake.cancellations and row(w)["state"] == "SELL_CANCELLING"
+    fake.status = ("CANCELLED", 2)
+    w.tick()
+    assert row(w)["state"] == "BLOCKED"
+    assert row(w)["closed_quantity"] == 2
 
 
 def test_invalid_quotes_and_fill_business_status_fail_closed(worker):
@@ -142,6 +191,10 @@ def test_invalid_quotes_and_fill_business_status_fail_closed(worker):
                                "filled_quantity": "0", "status": "FILLED"}]}):
         with pytest.raises(BrokerError):
             checked_order(data, "id", "BUY")
+
+    partial = {"orders": [{"client_order_id": "five", "side": "BUY", "total_quantity": "5",
+                            "filled_quantity": "2", "status": "PARTIAL_FILLED"}]}
+    assert checked_order(partial, "five", "BUY", quantity=5) == ("PARTIAL_FILLED", 2)
 
 
 def test_dry_run_records_are_not_replayed_into_paper_orders(worker):
@@ -185,6 +238,8 @@ def test_preflight_requires_authentication_and_never_places_or_queues(worker):
     with TestClient(create_app(w.settings, lambda: now[0], fake)) as client:
         assert client.post("/paper/preflight?price=778.62").status_code == 401
         result = client.post("/paper/preflight?price=778.62", headers={"X-Webhook-Token": w.settings.token})
-        assert result.json()["status"] == "preview_confirmed" and not fake.placements
+        assert result.json()["status"] == "preview_confirmed"
+        assert result.json()["quantity"] == w.settings.paper_quantity
+        assert not fake.placements
         with sqlite3.connect(w.settings.database) as db:
             assert db.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0] == 1
