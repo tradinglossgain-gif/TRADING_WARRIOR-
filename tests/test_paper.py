@@ -206,7 +206,7 @@ def test_dry_run_records_are_not_replayed_into_paper_orders(worker):
     assert not fake.placements
 
 
-@pytest.mark.parametrize("source_version", ["sweep_retest_v1", "amd_sweep_v1"])
+@pytest.mark.parametrize("source_version", ["sweep_retest_v1", "amd_sweep_v1", "vwap_flow_breakout_v1"])
 def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_path, monkeypatch, source_version):
     from types import SimpleNamespace
     from fastapi.testclient import TestClient
