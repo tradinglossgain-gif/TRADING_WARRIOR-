@@ -107,16 +107,21 @@ only charts this may not arrive until later. No scheduled flatten is implemented
 {
   "token": "REPLACE_WITH_YOUR_PRIVATE_WEBHOOK_TOKEN",
   "trade_id": "SPY-5-UNIQUE_BAR_TIMESTAMP",
-  "source_version": "vwap_flow_breakout_v1",
+  "source_version": "amd_sweep_v1",
   "action": "ENTRY",
   "timestamp": "REPLACE_WITH_CURRENT_UTC_ISO_TIMESTAMP",
   "symbol": "SPY",
   "direction": "CALL",
   "entry": 600.00,
   "stop": 599.00,
-  "target": 602.00
+  "target": 602.00,
+  "quantity": 5
 }
 ```
+
+
+
+For v25 paper alerts, quantity must be 1–5 and exactly match Render’s `PAPER_QUANTITY`. Alerts with a different quantity are rejected. The worker uses the same selected ATM contract for entry and exit; no trade is submitted for mismatched sizes.
 
 Use `PUT` with `target < entry < stop`. Exit actions are `EXIT_SL`, `EXIT_TP`,
 or `EXPIRE`, using the original trade ID, direction and levels, with a fresh
