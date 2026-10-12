@@ -42,13 +42,16 @@ def atm_contract(payload, now):
             "direction": direction}
 
 
-def order_payload(contract, client_id, side, limit=None):
+def order_payload(contract, client_id, side, limit=None, quantity=1):
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 5:
+        raise BrokerError("INVALID_QUANTITY")
+    quantity_text = str(quantity)
     order = {"client_order_id": client_id, "combo_type": "NORMAL",
-             "order_type": "LIMIT" if side == "BUY" else "MARKET", "quantity": "1",
+             "order_type": "LIMIT" if side == "BUY" else "MARKET", "quantity": quantity_text,
              "option_strategy": "SINGLE", "side": side, "time_in_force": "DAY",
              "entrust_type": "QTY", "instrument_type": "OPTION", "market": "US",
              "symbol": "SPY", "position_intent": "BUY_TO_OPEN" if side == "BUY" else "SELL_TO_CLOSE",
-             "legs": [{"side": side, "quantity": "1", "symbol": "SPY",
+             "legs": [{"side": side, "quantity": quantity_text, "symbol": "SPY",
                        "strike_price": contract["strike"], "option_expire_date": contract["expiry"],
                        "instrument_type": "OPTION", "option_type": contract["direction"], "market": "US"}]}
     if side == "BUY":
@@ -79,7 +82,7 @@ def checked_quote(data, contract, now, premium_cap):
     return str(limit)
 
 
-def checked_order(data, client_id, side):
+def checked_order(data, client_id, side, quantity=1):
     if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
         raise BrokerError("UNEXPECTED_ORDER_RESPONSE")
     orders = [item for item in data["orders"] if item.get("client_order_id") == client_id]
@@ -88,19 +91,24 @@ def checked_order(data, client_id, side):
     order = orders[0]
     status = order["status"]
     filled = Decimal(str(order.get("filled_quantity", "0")))
-    if order.get("side") != side or Decimal(str(order["total_quantity"])) != 1:
+    expected = Decimal(quantity)
+    if order.get("side") != side or Decimal(str(order["total_quantity"])) != expected:
         raise BrokerError("ORDER_MISMATCH")
     if status not in {"PENDING", "SUBMITTED", "CANCELLED", "FILLED", "FAILED", "PARTIAL_FILLED"}:
         raise BrokerError("UNKNOWN_ORDER_STATUS")
-    if not filled.is_finite() or filled not in {Decimal(0), Decimal(1)}:
+    if not filled.is_finite() or filled < 0 or filled > expected:
         raise BrokerError("UNEXPECTED_FILL_QUANTITY")
-    if status == "FILLED" and filled != 1:
+    if status == "FILLED" and filled != expected:
         raise BrokerError("INCONSISTENT_FILL")
+    if status == "PARTIAL_FILLED" and not 0 < filled < expected:
+        raise BrokerError("INCONSISTENT_PARTIAL_FILL")
     return status, int(filled)
 
 
 class SandboxBroker:
-    def __init__(self, account_number, premium_cap):
+    def __init__(self, account_number, premium_cap, quantity=5):
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 5:
+            raise BrokerError("INVALID_QUANTITY")
         self.trade = client_from_env()  # Rejects every host except api.sandbox.webull.com.
         sdk = self.trade.account_v2.client
         sdk.set_token_dir(os.environ.get("WEBULL_OPENAPI_TOKEN_DIR", ".local/webull-token"))
@@ -114,13 +122,14 @@ class SandboxBroker:
             raise BrokerError("PAPER_ACCOUNT_NOT_FOUND")
         self.account_id = matches[0]["account_id"]
         self.premium_cap = premium_cap
+        self.quantity = quantity
 
     def prepare(self, payload, client_id, now):
         contract = atm_contract(payload, now)
         quote = response_data(self.data.option_market_data.get_option_snapshot(contract["symbol"], "US_OPTION"))
         contract["limit"] = checked_quote(quote, contract, now, self.premium_cap)
         preview = response_data(self.trade.order_v3.preview_order(
-            self.account_id, [order_payload(contract, client_id, "BUY", contract["limit"])]))
+            self.account_id, [order_payload(contract, client_id, "BUY", contract["limit"], self.quantity)]))
         if not isinstance(preview, dict) or "estimated_cost" not in preview:
             raise BrokerError("UNCONFIRMED_PREVIEW")
         cost = Decimal(str(preview["estimated_cost"]))
@@ -128,15 +137,17 @@ class SandboxBroker:
             raise BrokerError("INVALID_PREVIEW_COST")
         return contract
 
-    def place(self, contract, client_id, side):
+    def place(self, contract, client_id, side, quantity=None):
+        quantity = self.quantity if quantity is None else quantity
         data = response_data(self.trade.order_v3.place_order(
-            self.account_id, [order_payload(contract, client_id, side, contract.get("limit"))]))
+            self.account_id, [order_payload(contract, client_id, side, contract.get("limit"), quantity)]))
         if not isinstance(data, dict) or data.get("client_order_id") != client_id or not data.get("order_id"):
             raise BrokerError("UNCONFIRMED_SUBMISSION")
 
-    def detail(self, client_id, side):
+    def detail(self, client_id, side, quantity=None):
+        quantity = self.quantity if quantity is None else quantity
         return checked_order(response_data(self.trade.order_v3.get_order_detail(self.account_id, client_id)),
-                             client_id, side)
+                             client_id, side, quantity)
 
     def cancel(self, client_id):
         response_data(self.trade.order_v3.cancel_order(self.account_id, client_id))
@@ -147,7 +158,14 @@ def initialize(db):
         trade_id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL,
         contract TEXT, buy_id TEXT NOT NULL UNIQUE, sell_id TEXT NOT NULL UNIQUE,
         submitted_at TEXT, exit_requested INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT, updated_at TEXT NOT NULL)""")
+        last_error TEXT, updated_at TEXT NOT NULL,
+        filled_quantity INTEGER NOT NULL DEFAULT 0,
+        closed_quantity INTEGER NOT NULL DEFAULT 0)""")
+    columns = {row[1] for row in db.execute("PRAGMA table_info(paper_trades)")}
+    if "filled_quantity" not in columns:
+        db.execute("ALTER TABLE paper_trades ADD COLUMN filled_quantity INTEGER NOT NULL DEFAULT 0")
+    if "closed_quantity" not in columns:
+        db.execute("ALTER TABLE paper_trades ADD COLUMN closed_quantity INTEGER NOT NULL DEFAULT 0")
 
 
 def enqueue(db, trade_id, canonical, now):
@@ -231,24 +249,35 @@ class PaperWorker:
                 self.update(trade_id, state="BUY_PENDING", last_error=None)
             elif state in {"BUY_SUBMITTING", "BUY_PENDING", "BUY_CANCELLING"}:
                 # A timed-out or interrupted submission is looked up, NEVER submitted again.
-                status, filled = self.broker.detail(row["buy_id"], "BUY")
-                if filled == 1:
-                    self.update(trade_id, state="FILLED", last_error=None)
+                quantity = self.settings.paper_quantity
+                status, filled = self.broker.detail(row["buy_id"], "BUY", quantity)
+                if status == "FILLED" and filled == quantity:
+                    self.update(trade_id, state="FILLED", filled_quantity=filled, last_error=None)
                 elif status in {"CANCELLED", "FAILED"}:
-                    self.update(trade_id, state="CLOSED", last_error=None)
+                    self.update(trade_id, state="FILLED" if filled else "CLOSED",
+                                filled_quantity=filled, last_error=None)
                 elif want_exit or state == "BUY_CANCELLING" or (now - datetime.fromisoformat(row["submitted_at"])).total_seconds() >= 60:
-                    self.update(trade_id, state="BUY_CANCELLING")
+                    self.update(trade_id, state="BUY_CANCELLING", filled_quantity=filled)
                     self.broker.cancel(row["buy_id"])
             elif state == "FILLED" and want_exit:
-                self.update(trade_id, state="SELL_SUBMITTING")
-                self.broker.place(json.loads(row["contract"]), row["sell_id"], "SELL")
+                self.update(trade_id, state="SELL_SUBMITTING", submitted_at=now.isoformat())
+                self.broker.place(json.loads(row["contract"]), row["sell_id"], "SELL",
+                                  int(row["filled_quantity"]))
                 self.update(trade_id, state="SELL_PENDING", last_error=None)
-            elif state in {"SELL_SUBMITTING", "SELL_PENDING"}:
-                status, filled = self.broker.detail(row["sell_id"], "SELL")
-                if filled == 1:
-                    self.update(trade_id, state="CLOSED", last_error=None)
+            elif state in {"SELL_SUBMITTING", "SELL_PENDING", "SELL_CANCELLING"}:
+                quantity = int(row["filled_quantity"])
+                status, filled = self.broker.detail(row["sell_id"], "SELL", quantity)
+                if status == "FILLED" and filled == quantity:
+                    self.update(trade_id, state="CLOSED", closed_quantity=filled, last_error=None)
                 elif status in {"CANCELLED", "FAILED"}:
-                    self.update(trade_id, state="BLOCKED", last_error="EXIT_REQUIRES_RECONCILIATION")
+                    if filled == quantity:
+                        self.update(trade_id, state="CLOSED", closed_quantity=filled, last_error=None)
+                    else:
+                        self.update(trade_id, state="BLOCKED", closed_quantity=filled,
+                                    last_error="EXIT_REQUIRES_RECONCILIATION")
+                elif state == "SELL_CANCELLING" or status == "PARTIAL_FILLED" or (now - datetime.fromisoformat(row["submitted_at"])).total_seconds() >= 60:
+                    self.update(trade_id, state="SELL_CANCELLING", closed_quantity=filled)
+                    self.broker.cancel(row["sell_id"])
         except Exception as error:
             safe_error = str(error) if isinstance(error, BrokerError) else "BROKER_CHECK_FAILED"
             if state == "PREPARE":
