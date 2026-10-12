@@ -52,6 +52,7 @@ class Settings:
     paper_enabled: bool = False
     paper_account_number: str = ""
     paper_premium_cap: str = "3.00"
+    paper_quantity: int = 5
 
     @classmethod
     def from_env(cls):
@@ -66,11 +67,17 @@ class Settings:
         cap = os.environ.get("PAPER_PREMIUM_CAP", "3.00")
         if not Decimal(cap).is_finite() or Decimal(cap) <= 0:
             raise RuntimeError("PAPER_PREMIUM_CAP must be positive")
+        try:
+            quantity = int(os.environ.get("PAPER_QUANTITY", "5"))
+        except ValueError:
+            raise RuntimeError("PAPER_QUANTITY must be an integer from 1 to 5") from None
+        if not 1 <= quantity <= 5:
+            raise RuntimeError("PAPER_QUANTITY must be an integer from 1 to 5")
         return cls(token, os.environ.get("DATABASE_PATH", ".local/events.sqlite3"),
                    os.environ.get("KILL_SWITCH_FILE", ".local/PAUSED"),
                    paper_enabled=mode == "true",
                    paper_account_number=os.environ.get("WEBULL_ACCOUNT_NUMBER", ""),
-                   paper_premium_cap=cap)
+                   paper_premium_cap=cap, paper_quantity=quantity)
 
 
 def create_app(settings: Settings, clock=None, broker=None):
@@ -105,7 +112,8 @@ def create_app(settings: Settings, clock=None, broker=None):
                     missing = [name for name in required if not os.environ.get(name)]
                     if missing:
                         raise RuntimeError("MISSING_" + "_AND_".join(missing))
-                client = broker or SandboxBroker(settings.paper_account_number, Decimal(settings.paper_premium_cap))
+                client = broker or SandboxBroker(settings.paper_account_number,
+                                                 Decimal(settings.paper_premium_cap), settings.paper_quantity)
                 worker = PaperWorker(settings, client, clock)
                 api.state.paper_worker = worker
                 worker.start()
@@ -141,7 +149,7 @@ def create_app(settings: Settings, clock=None, broker=None):
         return {"status": "degraded" if startup_error else "ok", "mode": mode, "broker_orders_enabled": settings.paper_enabled and running,
                 "paused": Path(settings.kill_file).exists(), "worker_running": running,
                 "paper_states": state_counts, "paper_reconciliation_required": errors > 0,
-                "contract_policy": "SPY_0DTE_ATM", "paper_quantity": 1,
+                "contract_policy": "SPY_0DTE_ATM", "paper_quantity": settings.paper_quantity,
                 "paper_premium_cap": settings.paper_premium_cap,
                 "paper_startup_error": startup_error,
                 "deployment_commit": os.environ.get("RENDER_GIT_COMMIT", "local")}
@@ -154,10 +162,12 @@ def create_app(settings: Settings, clock=None, broker=None):
             raise HTTPException(401, "Invalid webhook token")
         try:
             now = clock()
-            client = broker or SandboxBroker(settings.paper_account_number, Decimal(settings.paper_premium_cap))
+            client = broker or SandboxBroker(settings.paper_account_number,
+                                                 Decimal(settings.paper_premium_cap), settings.paper_quantity)
             contract = client.prepare({"entry": price, "direction": direction,
                                        "timestamp": now.isoformat()}, uuid.uuid4().hex, now)
-            return {"status": "preview_confirmed", "contract": contract, "quantity": 1,
+            return {"status": "preview_confirmed", "contract": contract,
+                    "quantity": settings.paper_quantity,
                     "order_sent": False, "contract_policy": "SPY_0DTE_ATM"}
         except Exception:
             raise HTTPException(503, "Sandbox preflight failed; verify keys, account, quote access and option permissions") from None
