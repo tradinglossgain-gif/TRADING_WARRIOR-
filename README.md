@@ -7,13 +7,16 @@ PaperTrade sandbox must be verified on the deployed service. No live trading end
 
 ## Automatic paper execution
 
-`paper.py` adds a durable sandbox-only execution worker. Deployment defaults to
-`PAPER_TRADING_ENABLED=false`. Enable it only after securely configuring sandbox
-keys and validating the deployed account, option quotes, preview and order lifecycle.
+`paper.py` adds a durable Webull-sandbox-only execution worker. The Render
+Blueprint enables paper mode with five contracts per entry. Keep the verified CASH
+sandbox account and API keys in Render's private environment settings. This worker
+has no production routing path.
 It selects today's SPY option at the nearest whole-dollar strike to the signal
 entry price (half-dollar ties round upward), confirms that exact contract with
-a fresh option snapshot, and buys one contract at its quoted ask with a DAY
-limit order. Default premium cap: $3.00 ($300 per contract, before fees).
+a fresh option snapshot, and buys five contracts at its quoted ask with a DAY
+limit order. `PAPER_QUANTITY` is bounded from 1 to 5 and defaults to 5. The
+default premium cap is $3.00 per share ($300 per contract, up to $1,500 total
+premium for five contracts, before fees).
 Unavailable contracts, invalid/stale quotes, and options above the cap are skipped.
 No different strike or expiry is substituted.
 
@@ -31,8 +34,9 @@ are never replayed. Contract, trade state, and deterministic buy/sell IDs persis
 in SQLite. Uncertain submissions are looked up, never automatically resubmitted.
 New entries are blocked while any paper order/position is unresolved. Unfilled
 entries are cancelled after 60 seconds, and their final fill/cancellation status
-must be confirmed. Exit signals close the same filled contract using a market
-SELL_TO_CLOSE order. A server-side 14:00 New York cutoff requests closure even
+must be confirmed. Partial entries are reconciled, and exits sell only confirmed
+filled contracts. Partial exits are cancelled and flagged for reconciliation.
+Exit signals close the same filled contract using a market SELL_TO_CLOSE order. A server-side 14:00 New York cutoff requests closure even
 if an exit webhook is lost. In paper mode the pause file also requests closure
 of worker-owned positions while blocking new entries. Broker outages and failed
 exits require reconciliation. Never replace the database to bypass order state.
