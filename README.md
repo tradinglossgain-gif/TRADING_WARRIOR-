@@ -107,6 +107,7 @@ only charts this may not arrive until later. No scheduled flatten is implemented
 {
   "token": "REPLACE_WITH_YOUR_PRIVATE_WEBHOOK_TOKEN",
   "trade_id": "SPY-5-UNIQUE_BAR_TIMESTAMP",
+  "source_version": "vwap_flow_breakout_v1",
   "action": "ENTRY",
   "timestamp": "REPLACE_WITH_CURRENT_UTC_ISO_TIMESTAMP",
   "symbol": "SPY",
