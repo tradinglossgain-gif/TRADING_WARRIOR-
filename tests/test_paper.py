@@ -153,7 +153,8 @@ def test_dry_run_records_are_not_replayed_into_paper_orders(worker):
     assert not fake.placements
 
 
-def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source_version", ["sweep_retest_v1", "amd_sweep_v1"])
+def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_path, monkeypatch, source_version):
     from types import SimpleNamespace
     from fastapi.testclient import TestClient
     monkeypatch.setattr(PaperWorker, "start", lambda self: setattr(self, "thread", SimpleNamespace(
@@ -161,7 +162,7 @@ def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_pa
     now = [datetime(2026, 10, 12, 14, 0, tzinfo=timezone.utc)]
     settings = Settings("x" * 40, str(tmp_path / "db"), str(tmp_path / "PAUSED"), paper_enabled=True)
     fake = FakeBroker()
-    payload = {"token": settings.token, "source_version": "sweep_retest_v1", "trade_id": "trade-1", "timestamp": now[0].isoformat(),
+    payload = {"token": settings.token, "source_version": source_version, "trade_id": "trade-1", "timestamp": now[0].isoformat(),
                "symbol": "SPY", "direction": "CALL", "entry": 778.62, "stop": 777, "target": 782}
     with TestClient(create_app(settings, lambda: now[0], fake)) as client:
         legacy = {key: value for key, value in payload.items() if key != "source_version"}

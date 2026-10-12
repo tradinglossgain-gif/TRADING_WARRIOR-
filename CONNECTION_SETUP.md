@@ -12,6 +12,12 @@ Paper ENTRY alerts must identify `source_version: sweep_retest_v1`; older
 indicator messages are rejected. This identifies the configured alert format,
 not cryptographic proof that the strategy rules were evaluated correctly.
 
+The original-layout replacement `spy_options_amd_sweep_v21.pine` is also supported
+with `source_version: amd_sweep_v1`. It integrates the user's supplied intermediate
+AMD swing method with closed-bar reclaim, displacement and retest. See
+`AMD_V21_NOTES.md`. Its sandbox alerts default off; Pine compilation and performance
+remain unverified. Stop previous alerts before switching to it.
+
 The new source remains uncompiled in TradingView. Default real-order-flow data
 gating remains intact, and sandbox alerts default off. No synthetic order flow
 is introduced. Before enabling it, connect verified external sources or explicitly
