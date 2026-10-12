@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -90,19 +91,38 @@ def create_app(settings: Settings, clock=None, broker=None):
         """)
         initialize(db)
     worker = None
+    startup_error = None
     mode = "paper" if settings.paper_enabled else "dry_run"
 
     @asynccontextmanager
     async def lifespan(api):
-        nonlocal worker
+        nonlocal worker, startup_error
         if settings.paper_enabled:
             try:
+                if broker is None:
+                    required = ("WEBULL_APP_KEY", "WEBULL_APP_SECRET", "WEBULL_ACCOUNT_NUMBER")
+                    missing = [name for name in required if not os.environ.get(name)]
+                    if missing:
+                        raise RuntimeError("MISSING_" + "_AND_".join(missing))
                 client = broker or SandboxBroker(settings.paper_account_number, Decimal(settings.paper_premium_cap))
                 worker = PaperWorker(settings, client, clock)
                 api.state.paper_worker = worker
                 worker.start()
-            except Exception:
-                raise RuntimeError("Paper worker startup failed; verify sandbox credentials and account configuration") from None
+            except Exception as error:
+                from paper import BrokerError
+                # Never echo arbitrary SDK exception text or signed requests.
+                known_missing = {"MISSING_" + "_AND_".join(names) for names in (
+                    ["WEBULL_APP_KEY"], ["WEBULL_APP_SECRET"], ["WEBULL_ACCOUNT_NUMBER"],
+                    ["WEBULL_APP_KEY", "WEBULL_APP_SECRET"],
+                    ["WEBULL_APP_KEY", "WEBULL_ACCOUNT_NUMBER"],
+                    ["WEBULL_APP_SECRET", "WEBULL_ACCOUNT_NUMBER"],
+                    ["WEBULL_APP_KEY", "WEBULL_APP_SECRET", "WEBULL_ACCOUNT_NUMBER"])}
+                message = str(error)
+                startup_error = message if message in known_missing else "SANDBOX_STARTUP_FAILED"
+                if isinstance(error, BrokerError) and message in {"PAPER_ACCOUNT_NOT_FOUND", "BROKER_HTTP_ERROR", "BROKER_BUSINESS_ERROR"}:
+                    startup_error = message
+                logging.getLogger(__name__).error("Paper worker disabled: %s", startup_error)
+                worker = None
         try:
             yield
         finally:
@@ -117,11 +137,13 @@ def create_app(settings: Settings, clock=None, broker=None):
             state_counts = dict(db.execute("SELECT state,COUNT(*) FROM paper_trades GROUP BY state").fetchall())
             errors = db.execute("SELECT COUNT(*) FROM paper_trades WHERE last_error IS NOT NULL AND state NOT IN ('CLOSED','SKIPPED')").fetchone()[0]
         running = bool(worker and worker.thread and worker.thread.is_alive())
-        return {"status": "ok", "mode": mode, "broker_orders_enabled": settings.paper_enabled and running,
+        return {"status": "degraded" if startup_error else "ok", "mode": mode, "broker_orders_enabled": settings.paper_enabled and running,
                 "paused": Path(settings.kill_file).exists(), "worker_running": running,
                 "paper_states": state_counts, "paper_reconciliation_required": errors > 0,
                 "contract_policy": "SPY_0DTE_ATM", "paper_quantity": 1,
-                "paper_premium_cap": settings.paper_premium_cap}
+                "paper_premium_cap": settings.paper_premium_cap,
+                "paper_startup_error": startup_error,
+                "deployment_commit": os.environ.get("RENDER_GIT_COMMIT", "local")}
 
     @api.post("/paper/preflight")
     def preflight(price: float = Query(gt=0, lt=10000),
@@ -178,6 +200,8 @@ def create_app(settings: Settings, clock=None, broker=None):
                     raise HTTPException(409, "Event ID reused with different data")
                 return {"status": "duplicate", "mode": mode, "event_id": event_id}
             if alert.action == "ENTRY":
+                if settings.paper_enabled and (worker is None or not worker.thread or not worker.thread.is_alive()):
+                    raise HTTPException(503, "Paper worker unavailable; inspect /health paper_startup_error")
                 hhmm = local.hour * 100 + local.minute
                 if local.weekday() >= 5 or not 945 <= hhmm < 1530:
                     raise HTTPException(422, "Entries allowed weekdays 09:45–15:30 New York")

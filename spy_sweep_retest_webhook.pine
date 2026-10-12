@@ -1,0 +1,245 @@
+//@version=6
+indicator("SPY Sweep Retest — Sandbox JSON", overlay=true, max_labels_count=200)
+
+// SPY setup monitor only. No orders, broker fills or performance results.
+// No OHLC-derived buy/sell numbers are presented as genuine order flow.
+groupWebhook = "Sandbox webhook"
+webhookToken = input.string("", "Private webhook token", group=groupWebhook)
+enablePaperAlerts = input.bool(false, "Enable sandbox JSON alerts", group=groupWebhook)
+jsonEscape(string value) =>
+    str.replace_all(str.replace_all(value, "\\", "\\\\"), "\"", "\\\"")
+webhookPayload(string id, string action, int side, float entry, float stop, float target) =>
+    stamp = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    "{\"token\":\"" + jsonEscape(webhookToken) + "\",\"trade_id\":\"" + id + "\",\"action\":\"" + action + "\",\"timestamp\":\"" + stamp + "\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(stop, format.mintick) + ",\"target\":" + str.tostring(target, format.mintick) + "}"
+
+groupFlow = "Order-flow data — entries blocked by default"
+mode = input.string("Require verified external order flow", "Mode", options=["Require verified external order flow", "Price-action-only research"], group=groupFlow)
+verifiedFlow = input.bool(false, "I connected verified aggressor buy/sell volume plots", group=groupFlow)
+buySource = input.source(close, "Actual aggressor buy-volume plot", group=groupFlow)
+sellSource = input.source(close, "Actual aggressor sell-volume plot", group=groupFlow)
+deltaMinimum = input.float(0.15, "Directional delta / classified volume minimum", minval=0, maxval=1, group=groupFlow)
+
+groupSetup = "Closed-bar setup"
+pivotBars = input.int(3, "Confirmed pivot left/right bars", minval=2, maxval=10, group=groupSetup)
+maxPivotAge = input.int(40, "Maximum pivot age (bars)", minval=5, group=groupSetup)
+confirmBars = input.int(4, "Bars allowed after sweep for displacement", minval=1, maxval=10, group=groupSetup)
+retestBars = input.int(4, "Bars allowed after displacement for retest", minval=1, maxval=10, group=groupSetup)
+bodyATR = input.float(0.7, "Displacement body minimum (ATR)", minval=0.1, group=groupSetup)
+maxRangeATR = input.float(2.0, "Displacement range maximum (ATR)", minval=0.5, group=groupSetup)
+minRvol = input.float(1.2, "Displacement relative volume", minval=0.1, group=groupSetup)
+minADX = input.float(18, "Displacement ADX minimum", minval=0, group=groupSetup)
+htf = input.timeframe("15", "Higher-timeframe trend", group=groupSetup)
+entryWindow = input.session("0945-1130,1330-1400", "Entry windows, New York", group=groupSetup)
+
+groupRisk = "Research execution"
+rewardRisk = input.float(2.0, "Fixed reward / risk", minval=1.5, group=groupRisk)
+stopBufferATR = input.float(0.15, "Stop buffer beyond sweep (ATR)", minval=0.05, group=groupRisk)
+maxRiskATR = input.float(1.5, "Maximum stop distance (ATR)", minval=0.3, group=groupRisk)
+limitLife = input.int(2, "Cancel unfilled entry after bars", minval=1, maxval=5, group=groupRisk)
+dailyLimit = input.int(2, "Maximum entry attempts / day", minval=1, maxval=5, group=groupRisk)
+cooldownBars = input.int(5, "Cooldown after a cycle", minval=1, group=groupRisk)
+
+if syminfo.ticker != "SPY" or not timeframe.isminutes or timeframe.multiplier > 5
+    runtime.error("Use standard SPY candles on a 1–5 minute chart.")
+if timeframe.in_seconds(htf) <= timeframe.in_seconds()
+    runtime.error("Trend timeframe must be higher than chart timeframe.")
+
+atr = ta.atr(14)
+ema = ta.ema(close, 20)
+vwapValue = ta.vwap(hlc3)
+[plusDI, minusDI, adx] = ta.dmi(14, 14)
+priorAverageVolume = ta.sma(volume, 20)[1]
+rvol = priorAverageVolume > 0 ? volume / priorAverageVolume : na
+// Offset + lookahead_on uses only the last COMPLETED higher-timeframe bar.
+[htfClose, htfEMA] = request.security(syminfo.tickerid, htf, [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+trendLong = close > vwapValue and close > ema and ema > ema[1] and htfClose > htfEMA
+trendShort = close < vwapValue and close < ema and ema < ema[1] and htfClose < htfEMA
+classifiedVolume = buySource + sellSource
+flowReady = verifiedFlow and not na(buySource) and not na(sellSource) and buySource >= 0 and sellSource >= 0 and classifiedVolume > 0
+deltaShare = flowReady ? (buySource - sellSource) / classifiedVolume : na
+researchOnly = mode == "Price-action-only research"
+flowLong = researchOnly or (flowReady and deltaShare >= deltaMinimum)
+flowShort = researchOnly or (flowReady and deltaShare <= -deltaMinimum)
+
+pivotHigh = ta.pivothigh(high, pivotBars, pivotBars)
+pivotLow = ta.pivotlow(low, pivotBars, pivotBars)
+var float knownHigh = na
+var float knownLow = na
+var int highConfirmedBar = na
+var int lowConfirmedBar = na
+microHigh = ta.highest(high, 3)[1]
+microLow = ta.lowest(low, 3)[1]
+inWindow = not na(time(timeframe.period, entryWindow, "America/New_York"))
+nyHour = hour(time_close, "America/New_York")
+nyMinute = minute(time_close, "America/New_York")
+beforeCutoff = nyHour * 100 + nyMinute < 1400 // Match paper worker hard cutoff.
+isWeekday = dayofweek(time, "America/New_York") >= dayofweek.monday and dayofweek(time, "America/New_York") <= dayofweek.friday
+sessionOK = inWindow and beforeCutoff and isWeekday
+newDay = ta.change(time("D", "0000-2359", "America/New_York")) != 0
+
+// State: 0 idle, ±1 reclaimed sweep, ±2 displacement, ±3 tracked setup.
+// A price touch is not confirmation that an option or underlying order filled.
+var int state = 0
+var int stageBar = na
+var int lastCycleBar = na
+var int attempts = 0
+var bool entryTouched = false
+var bool entryAlertSent = false
+var string webhookTradeId = ""
+var float sweepLevel = na
+var float sweepExtreme = na
+var float structuralBreak = na
+var float sweepATR = na
+var float plannedEntry = na
+var float plannedStop = na
+var float plannedTarget = na
+bool callSetup = false
+bool putSetup = false
+bool cycleEnded = false
+
+if barstate.isconfirmed
+    if newDay
+        attempts := 0
+
+    // Track level touches on later closed bars. No synthetic P&L or fill claims.
+    if math.abs(state) == 3 and bar_index > stageBar
+        isLongSetup = state > 0
+        invalidatedSetup = isLongSetup ? low <= plannedStop : high >= plannedStop
+        touchedEntry = isLongSetup ? low <= plannedEntry : high >= plannedEntry
+        touchedTarget = isLongSetup ? high >= plannedTarget : low <= plannedTarget
+        bool finishSetup = false
+        string outcome = ""
+        if invalidatedSetup
+            // When candle ordering is unknown, report invalidation first.
+            outcome := "SETUP INVALIDATED — SL touched"
+            finishSetup := true
+        else
+            bool firstTouch = not entryTouched and touchedEntry
+            entryTouched := entryTouched or touchedEntry
+            if firstTouch and not touchedTarget and beforeCutoff and sessionOK and barstate.isrealtime and enablePaperAlerts and str.length(webhookToken) >= 32
+                alert(webhookPayload(webhookTradeId, "ENTRY", state > 0 ? 1 : -1, plannedEntry, plannedStop, plannedTarget), alert.freq_once_per_bar_close)
+                entryAlertSent := true
+            if entryTouched and touchedTarget
+                outcome := "TARGET TOUCHED — no fill/P&L claim"
+                finishSetup := true
+            else if not entryTouched and bar_index - stageBar >= limitLife
+                outcome := "UNTOUCHED ENTRY EXPIRED"
+                finishSetup := true
+        if finishSetup
+            label.new(bar_index, close, outcome, color=color.gray, textcolor=color.white)
+            if barstate.isrealtime and entryAlertSent
+                exitAction = invalidatedSetup ? "EXIT_SL" : "EXIT_TP"
+                alert(webhookPayload(webhookTradeId, exitAction, state > 0 ? 1 : -1, plannedEntry, plannedStop, plannedTarget), alert.freq_once_per_bar_close)
+            state := 0
+            lastCycleBar := bar_index
+            cycleEnded := true
+            entryTouched := false
+
+    if not beforeCutoff and state != 0
+        label.new(bar_index, close, "SETUP ENDED — session cutoff", color=color.gray, textcolor=color.white)
+        if barstate.isrealtime and entryAlertSent
+            alert(webhookPayload(webhookTradeId, "EXPIRE", state > 0 ? 1 : -1, plannedEntry, plannedStop, plannedTarget), alert.freq_once_per_bar_close)
+        state := 0
+        lastCycleBar := bar_index
+        cycleEnded := true
+        entryTouched := false
+
+    // No rebuilding the stop from current ATR: sweep invalidation stays frozen.
+    if math.abs(state) == 1 or math.abs(state) == 2
+        invalidated = state > 0 ? low <= sweepExtreme : high >= sweepExtreme
+        elapsed = bar_index - stageBar
+        expired = math.abs(state) == 1 ? elapsed > confirmBars : elapsed > retestBars
+        if invalidated or expired or not sessionOK
+            state := 0
+            lastCycleBar := bar_index
+            cycleEnded := true
+
+    // A retest must occur on a LATER bar than displacement.
+    if math.abs(state) == 2 and bar_index > stageBar
+        direction = state > 0 ? 1 : -1
+        retest = direction == 1 ? low <= structuralBreak + sweepATR * 0.15 and low >= structuralBreak - sweepATR * 0.30 and close > structuralBreak and close > open : high >= structuralBreak - sweepATR * 0.15 and high <= structuralBreak + sweepATR * 0.30 and close < structuralBreak and close < open
+        aligned = direction == 1 ? trendLong and flowLong : trendShort and flowShort
+        if retest and aligned
+            candidateEntry = math.round_to_mintick(structuralBreak)
+            candidateStop = math.round_to_mintick(sweepExtreme - direction * sweepATR * stopBufferATR)
+            risk = direction * (candidateEntry - candidateStop)
+            candidateTarget = math.round_to_mintick(candidateEntry + direction * risk * rewardRisk)
+            opposingLiquidity = direction == 1 ? knownHigh : knownLow
+            // Unknown or obstructed target space does not qualify.
+            roomOK = not na(opposingLiquidity) and direction * (opposingLiquidity - candidateEntry) >= risk * rewardRisk
+            riskOK = risk >= syminfo.mintick * 5 and risk <= sweepATR * maxRiskATR
+            if riskOK and roomOK and attempts < dailyLimit
+                plannedEntry := candidateEntry
+                plannedStop := candidateStop
+                plannedTarget := candidateTarget
+                state := direction * 3
+                stageBar := bar_index
+                attempts += 1
+                entryTouched := false
+                entryAlertSent := false
+                webhookTradeId := "SWEEP-" + timeframe.period + "-" + str.tostring(time)
+                if direction == 1
+                    callSetup := true
+                else
+                    putSetup := true
+                text = (direction == 1 ? "CALL SETUP" : "PUT SETUP") + " — RESEARCH\nPlanned SPY limit " + str.tostring(plannedEntry, format.mintick) + "\nSL " + str.tostring(plannedStop, format.mintick) + " | TP " + str.tostring(plannedTarget, format.mintick)
+                label.new(bar_index, close, text, color=color.gray, textcolor=color.white)
+                // A plan alone sends no webhook. Await a later observed touch.
+
+    // Displacement cannot confirm on the sweep candle.
+    if math.abs(state) == 1 and bar_index > stageBar
+        span = math.max(high - low, syminfo.mintick)
+        body = math.abs(close - open)
+        bullishDisplacement = close > structuralBreak and close > open and (high - close) / span <= 0.25 and trendLong and flowLong
+        bearishDisplacement = close < structuralBreak and close < open and (close - low) / span <= 0.25 and trendShort and flowShort
+        power = body >= atr * bodyATR and span <= atr * maxRangeATR and rvol >= minRvol and adx >= minADX
+        if power and (state == 1 ? bullishDisplacement : bearishDisplacement)
+            state := state > 0 ? 2 : -2
+            stageBar := bar_index
+
+    coolingOK = na(lastCycleBar) or bar_index - lastCycleBar >= cooldownBars
+    if state == 0 and not cycleEnded and sessionOK and coolingOK and attempts < dailyLimit
+        // Pivots are available only AFTER confirmation; never backdated.
+        freshLow = not na(knownLow) and bar_index > lowConfirmedBar and bar_index - lowConfirmedBar <= maxPivotAge
+        freshHigh = not na(knownHigh) and bar_index > highConfirmedBar and bar_index - highConfirmedBar <= maxPivotAge
+        span = math.max(high - low, syminfo.mintick)
+        longSweep = freshLow and low < knownLow - syminfo.mintick and close > knownLow and close > open and (close - low) / span >= 0.65
+        shortSweep = freshHigh and high > knownHigh + syminfo.mintick and close < knownHigh and close < open and (high - close) / span >= 0.65
+        if longSweep and not shortSweep and flowLong
+            state := 1
+            sweepLevel := knownLow
+            sweepExtreme := low
+            structuralBreak := microHigh
+            sweepATR := atr
+            stageBar := bar_index
+        else if shortSweep and not longSweep and flowShort
+            state := -1
+            sweepLevel := knownHigh
+            sweepExtreme := high
+            structuralBreak := microLow
+            sweepATR := atr
+            stageBar := bar_index
+
+    // Publish newly confirmed pivots AFTER this bar's setup decisions.
+    if not na(pivotHigh)
+        knownHigh := pivotHigh
+        highConfirmedBar := bar_index
+    if not na(pivotLow)
+        knownLow := pivotLow
+        lowConfirmedBar := bar_index
+
+plot(vwapValue, "VWAP", color=color.orange)
+plot(ema, "EMA 20", color=color.blue)
+plot(knownHigh, "Confirmed liquidity high", color=color.new(color.red, 55), style=plot.style_stepline)
+plot(knownLow, "Confirmed liquidity low", color=color.new(color.green, 55), style=plot.style_stepline)
+showTrade = math.abs(state) == 3
+plot(showTrade ? plannedEntry : na, "Pending / planned SPY entry", color=color.white, style=plot.style_linebr)
+plot(showTrade ? plannedStop : na, "Frozen SPY stop", color=color.red, style=plot.style_linebr)
+plot(showTrade ? plannedTarget : na, "Frozen SPY target", color=color.green, style=plot.style_linebr)
+plotshape(callSetup, "Confirmed CALL setup", shape.triangleup, location.belowbar, color=color.green, size=size.small)
+plotshape(putSetup, "Confirmed PUT setup", shape.triangledown, location.abovebar, color=color.red, size=size.small)
+var table status = table.new(position.top_right, 1, 2)
+if barstate.islast
+    statusText = researchOnly ? "PRICE-ACTION RESEARCH — no order flow" : flowReady ? "EXTERNAL FLOW INPUTS ENABLED — verify provider" : "BLOCKED — verified order-flow plots required"
+    table.cell(status, 0, 0, statusText, text_color=color.white, bgcolor=researchOnly ? color.orange : flowReady ? color.teal : color.red)
+    table.cell(status, 0, 1, "SETUPS ONLY — no broker fills or proven edge.", text_color=color.white, bgcolor=color.black)

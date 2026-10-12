@@ -25,6 +25,9 @@ def client_from_env():
     sdk = ApiClient(os.environ["WEBULL_APP_KEY"], os.environ["WEBULL_APP_SECRET"], "us",
                     auto_retry=False, connect_timeout=2, timeout=5)
     sdk.add_endpoint("us", host)
+    # TradeClient initializes authentication in its constructor. Configure its
+    # persistent token directory BEFORE creating that client.
+    sdk.set_token_dir(os.environ.get("WEBULL_OPENAPI_TOKEN_DIR", ".local/webull-token"))
     # Avoid SDK default debug/file logging of signed requests and response bodies.
     sdk.set_stream_logger(log_level=logging.CRITICAL)
     return TradeClient(sdk)
