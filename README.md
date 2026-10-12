@@ -3,7 +3,41 @@
 An authenticated, persistent receiver for SPY CALL/PUT signals and SPY entry,
 stop-loss, take-profit levels. **Current mode is dry run: alerts are recorded,
 and no Webull order is sent.** Webull connectivity and options support in the
-PaperTrade sandbox remain unverified. No live trading endpoint is enabled.
+PaperTrade sandbox must be verified on the deployed service. No live trading endpoint is enabled.
+
+## Automatic paper execution
+
+`paper.py` adds a durable sandbox-only execution worker. Deployment defaults to
+`PAPER_TRADING_ENABLED=false`. Enable it only after securely configuring sandbox
+keys and validating the deployed account, option quotes, preview and order lifecycle.
+It selects today's SPY option at the nearest whole-dollar strike to the signal
+entry price (half-dollar ties round upward), confirms that exact contract with
+a fresh option snapshot, and buys one contract at its quoted ask with a DAY
+limit order. Default premium cap: $3.00 ($300 per contract, before fees).
+Unavailable contracts, invalid/stale quotes, and options above the cap are skipped.
+No different strike or expiry is substituted.
+
+Configure `WEBULL_APP_KEY` and `WEBULL_APP_SECRET` privately in Render.
+Set `WEBULL_ACCOUNT_NUMBER` privately to the verified CASH sandbox account number.
+SDK requests are restricted to `api.sandbox.webull.com`.
+`WEBULL_OPENAPI_TOKEN_DIR=/var/data/webull-token` persists any SDK authentication token.
+
+`POST /paper/preflight?price=SIGNAL_PRICE&direction=CALL`, with private header
+`X-Webhook-Token`, checks account access, option quotes, and previews one order.
+It never submits or queues an order. Never put the token in a URL.
+
+Only future accepted entries are queued after enablement; old dry-run events
+are never replayed. Contract, trade state, and deterministic buy/sell IDs persist
+in SQLite. Uncertain submissions are looked up, never automatically resubmitted.
+New entries are blocked while any paper order/position is unresolved. Unfilled
+entries are cancelled after 60 seconds, and their final fill/cancellation status
+must be confirmed. Exit signals close the same filled contract using a market
+SELL_TO_CLOSE order. A server-side 14:00 New York cutoff requests closure even
+if an exit webhook is lost. In paper mode the pause file also requests closure
+of worker-owned positions while blocking new entries. Broker outages and failed
+exits require reconciliation. Never replace the database to bypass order state.
+Use exactly one worker/process. `/health` reports worker status, aggregate paper
+states and whether reconciliation is required.
 
 ## Run locally
 
@@ -142,9 +176,8 @@ but GPTPAPER account permissions and an actual option preview remain unverified.
 
 Obtain a public HTTPS deployment, configure replacement credentials, confirm
 sandbox options support, and verify account access plus an actual option
-preview. Then implement and validate contract selection, order submission,
-fill/status reconciliation, cancellations, and exits on the same filled option
-contract. This receiver intentionally has no order-submission worker yet;
-changing environment variables cannot enable trading. Broker integration cannot
-be validated without those external prerequisites. ChatGPT is not connected to
-the account and this chat is not a continuously running trade supervisor.
+preview. Validate contract selection, submission, fill/status reconciliation,
+cancellation, and closing the same filled option on the deployed sandbox.
+The worker is implemented locally; local tests and previews alone do not confirm
+activation. Render hosts the deployed worker. This chat is not a continuously
+running trade supervisor.

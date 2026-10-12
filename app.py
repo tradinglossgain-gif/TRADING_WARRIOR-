@@ -1,4 +1,6 @@
-"""TradingView alert intake. This service never places broker orders."""
+"""Authenticated TradingView intake with optional sandbox-only paper execution."""
+from contextlib import asynccontextmanager
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -45,6 +47,9 @@ class Settings:
     kill_file: str
     daily_limit: int = 5
     cooldown_seconds: int = 60
+    paper_enabled: bool = False
+    paper_account_number: str = ""
+    paper_premium_cap: str = "3.00"
 
     @classmethod
     def from_env(cls):
@@ -53,11 +58,21 @@ class Settings:
             token = Path(os.environ["WEBHOOK_TOKEN_FILE"]).read_text().strip()
         if len(token) < 32:
             raise RuntimeError("Set WEBHOOK_TOKEN or WEBHOOK_TOKEN_FILE (minimum 32 characters)")
+        mode = os.environ.get("PAPER_TRADING_ENABLED", "false")
+        if mode not in {"true", "false"}:
+            raise RuntimeError("PAPER_TRADING_ENABLED must be true or false")
+        cap = os.environ.get("PAPER_PREMIUM_CAP", "3.00")
+        if not Decimal(cap).is_finite() or Decimal(cap) <= 0:
+            raise RuntimeError("PAPER_PREMIUM_CAP must be positive")
         return cls(token, os.environ.get("DATABASE_PATH", ".local/events.sqlite3"),
-                   os.environ.get("KILL_SWITCH_FILE", ".local/PAUSED"))
+                   os.environ.get("KILL_SWITCH_FILE", ".local/PAUSED"),
+                   paper_enabled=mode == "true",
+                   paper_account_number=os.environ.get("WEBULL_ACCOUNT_NUMBER", ""),
+                   paper_premium_cap=cap)
 
 
-def create_app(settings: Settings, clock=None):
+def create_app(settings: Settings, clock=None, broker=None):
+    from paper import PaperWorker, SandboxBroker, enqueue, initialize
     clock = clock or (lambda: datetime.now(timezone.utc))
     Path(settings.database).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(settings.database) as db:
@@ -73,14 +88,56 @@ def create_app(settings: Settings, clock=None):
                 accepted_at TEXT NOT NULL, active INTEGER NOT NULL
             );
         """)
-    api = FastAPI(title="SPY TradingView receiver", docs_url=None, redoc_url=None)
+        initialize(db)
+    worker = None
+    mode = "paper" if settings.paper_enabled else "dry_run"
+
+    @asynccontextmanager
+    async def lifespan(api):
+        nonlocal worker
+        if settings.paper_enabled:
+            try:
+                client = broker or SandboxBroker(settings.paper_account_number, Decimal(settings.paper_premium_cap))
+                worker = PaperWorker(settings, client, clock)
+                api.state.paper_worker = worker
+                worker.start()
+            except Exception:
+                raise RuntimeError("Paper worker startup failed; verify sandbox credentials and account configuration") from None
+        try:
+            yield
+        finally:
+            if worker:
+                worker.stop()
+
+    api = FastAPI(title="SPY TradingView receiver", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     @api.get("/health")
     def health():
         with sqlite3.connect(settings.database) as db:
-            db.execute("SELECT 1").fetchone()
-        return {"status": "ok", "mode": "dry_run", "broker_orders_enabled": False,
-                "paused": Path(settings.kill_file).exists()}
+            state_counts = dict(db.execute("SELECT state,COUNT(*) FROM paper_trades GROUP BY state").fetchall())
+            errors = db.execute("SELECT COUNT(*) FROM paper_trades WHERE last_error IS NOT NULL AND state NOT IN ('CLOSED','SKIPPED')").fetchone()[0]
+        running = bool(worker and worker.thread and worker.thread.is_alive())
+        return {"status": "ok", "mode": mode, "broker_orders_enabled": settings.paper_enabled and running,
+                "paused": Path(settings.kill_file).exists(), "worker_running": running,
+                "paper_states": state_counts, "paper_reconciliation_required": errors > 0,
+                "contract_policy": "SPY_0DTE_ATM", "paper_quantity": 1,
+                "paper_premium_cap": settings.paper_premium_cap}
+
+    @api.post("/paper/preflight")
+    def preflight(price: float = Query(gt=0, lt=10000),
+                  direction: Literal["CALL", "PUT"] = "CALL",
+                  x_webhook_token: str = Header(default="")):
+        if not secrets.compare_digest(x_webhook_token.encode(), settings.token.encode()):
+            raise HTTPException(401, "Invalid webhook token")
+        try:
+            now = clock()
+            client = broker or SandboxBroker(settings.paper_account_number, Decimal(settings.paper_premium_cap))
+            contract = client.prepare({"entry": price, "direction": direction,
+                                       "timestamp": now.isoformat()}, uuid.uuid4().hex, now)
+            return {"status": "preview_confirmed", "contract": contract, "quantity": 1,
+                    "order_sent": False, "contract_policy": "SPY_0DTE_ATM"}
+        except Exception:
+            raise HTTPException(503, "Sandbox preflight failed; verify keys, account, quote access and option permissions") from None
 
     @api.post("/webhook")
     async def webhook(request: Request):
@@ -119,13 +176,15 @@ def create_app(settings: Settings, clock=None):
             if prior:
                 if prior[0] != fingerprint:
                     raise HTTPException(409, "Event ID reused with different data")
-                return {"status": "duplicate", "mode": "dry_run", "event_id": event_id}
+                return {"status": "duplicate", "mode": mode, "event_id": event_id}
             if alert.action == "ENTRY":
                 hhmm = local.hour * 100 + local.minute
                 if local.weekday() >= 5 or not 945 <= hhmm < 1530:
                     raise HTTPException(422, "Entries allowed weekdays 09:45–15:30 New York")
                 if db.execute("SELECT 1 FROM setups WHERE active=1").fetchone():
                     raise HTTPException(409, "A signal setup is already active")
+                if settings.paper_enabled and db.execute("SELECT 1 FROM paper_trades WHERE state NOT IN ('CLOSED','SKIPPED')").fetchone():
+                    raise HTTPException(409, "A paper trade is pending, open, or requires reconciliation")
                 count = db.execute("SELECT COUNT(*) FROM setups WHERE day=?", (day,)).fetchone()[0]
                 if count >= settings.daily_limit:
                     raise HTTPException(429, "Daily signal limit reached")
@@ -136,6 +195,10 @@ def create_app(settings: Settings, clock=None):
                     raise HTTPException(409, "Trade ID already used")
                 db.execute("INSERT INTO setups VALUES (?, ?, ?, ?, ?, 1)",
                            (alert.trade_id, alert.direction, levels, day, now.isoformat()))
+                if settings.paper_enabled:
+                    if not (worker and worker.thread and worker.thread.is_alive()):
+                        raise HTTPException(503, "Paper worker unavailable")
+                    enqueue(db, alert.trade_id, canonical, now)
             else:
                 setup = db.execute("SELECT direction, levels, active FROM setups WHERE trade_id=?",
                                    (alert.trade_id,)).fetchone()
@@ -144,9 +207,11 @@ def create_app(settings: Settings, clock=None):
                 if setup[0] != alert.direction or setup[1] != levels:
                     raise HTTPException(409, "Exit does not match entry")
                 db.execute("UPDATE setups SET active=0 WHERE trade_id=?", (alert.trade_id,))
+                if settings.paper_enabled:
+                    db.execute("UPDATE paper_trades SET exit_requested=1 WHERE trade_id=?", (alert.trade_id,))
             db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
                        (event_id, fingerprint, canonical, now.isoformat(), order_id))
-        return {"status": "recorded", "mode": "dry_run", "event_id": event_id,
+        return {"status": "queued" if settings.paper_enabled else "recorded", "mode": mode, "event_id": event_id,
                 "broker_order_sent": False}
 
     return api

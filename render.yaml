@@ -19,3 +19,11 @@ services:
         value: /var/data/events.sqlite3
       - key: KILL_SWITCH_FILE
         value: /var/data/PAUSED
+      - key: PAPER_TRADING_ENABLED
+        value: "false"
+      - key: WEBULL_ACCOUNT_NUMBER
+        sync: false
+      - key: PAPER_PREMIUM_CAP
+        value: "3.00"
+      - key: WEBULL_OPENAPI_TOKEN_DIR
+        value: /var/data/webull-token
