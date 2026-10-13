@@ -1,0 +1,186 @@
+//@version=6
+indicator("SPY EMA v26 — Every Cross + ENTRY / SL / TP Boxes", overlay=true, max_boxes_count=100, max_lines_count=150, max_labels_count=200)
+// Chart signals and modeled SPY exits only. No broker-order webhook is sent.
+// All entry markers are placed on the actual confirmed crossover bar.
+
+groupEntry = "EMA entries"
+fastLength = input.int(10, "Fast EMA", minval=1, group=groupEntry)
+slowLength = input.int(15, "Slow EMA", minval=2, group=groupEntry)
+regularHoursOnly = input.bool(false, "Draw crosses only during 09:30–16:00 New York", group=groupEntry)
+contracts = input.int(5, "Reference option contracts (display only)", minval=1, maxval=20, group=groupEntry)
+
+groupRisk = "Frame levels — SPY prices"
+atrLength = input.int(14, "ATR length", minval=1, group=groupRisk)
+swingBars = input.int(3, "Stop: recent swing bars", minval=1, maxval=20, group=groupRisk)
+stopBufferATR = input.float(0.10, "Stop: buffer beyond swing (ATR)", minval=0, step=0.05, group=groupRisk)
+minimumRiskATR = input.float(0.5, "Minimum stop distance (ATR)", minval=0.1, step=0.1, group=groupRisk)
+rewardR = input.float(2.0, "Take profit: risk multiple", minval=0.5, maxval=10, step=0.25, group=groupRisk)
+
+groupDisplay = "Clear trade boxes"
+frameBars = input.int(15, "Frame width (bars)", minval=4, maxval=100, group=groupDisplay)
+keepFrames = input.int(6, "Recent frames to keep", minval=1, maxval=20, group=groupDisplay)
+showContext = input.bool(true, "Show market context and latest exact prices", group=groupDisplay)
+showTrend = input.bool(true, "Show EMA50 and VWAP", group=groupDisplay)
+
+if fastLength >= slowLength
+    runtime.error("Fast EMA length must be smaller than slow EMA length.")
+if syminfo.ticker != "SPY" or not timeframe.isminutes or timeframe.multiplier > 5
+    runtime.error("Use standard SPY 1–5 minute candles, preferably 5 minutes.")
+
+fast = ta.ema(close, fastLength)
+slow = ta.ema(close, slowLength)
+trend = ta.ema(close, 50)
+vwapPrice = ta.vwap(hlc3)
+atrValue = ta.atr(atrLength)
+recentLow = ta.lowest(low, swingBars)
+recentHigh = ta.highest(high, swingBars)
+volumeMean = ta.sma(volume, 20)
+rvol = volumeMean > 0 ? volume / volumeMean : na
+// Previous completed higher-timeframe candles only; no developing HTF bias.
+[close15, ema15TF] = request.security(syminfo.tickerid, "15", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+[close60, ema60TF] = request.security(syminfo.tickerid, "60", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+crossUp = ta.crossover(fast, slow)
+crossDown = ta.crossunder(fast, slow)
+inRegularHours = not na(time(timeframe.period, "0930-1600:23456", "America/New_York"))
+dataReady = not na(atrValue) and not na(recentLow) and not na(recentHigh)
+callSignal = barstate.isconfirmed and dataReady and crossUp and (not regularHoursOnly or inRegularHours)
+putSignal = barstate.isconfirmed and dataReady and crossDown and (not regularHoursOnly or inRegularHours)
+
+plot(fast, "Fast EMA", color=color.aqua, linewidth=2)
+plot(slow, "Slow EMA", color=color.orange, linewidth=2)
+plot(showTrend ? trend : na, "EMA50 — context only", color=color.purple)
+plot(showTrend ? vwapPrice : na, "VWAP — context only", color=color.fuchsia)
+plotshape(callSignal, "Confirmed CALL cross", shape.labelup, location.belowbar, color.teal, text="CALL", textcolor=color.white, size=size.small)
+plotshape(putSignal, "Confirmed PUT cross", shape.labeldown, location.abovebar, color.red, text="PUT", textcolor=color.white, size=size.small)
+
+type TradeFrame
+    int side
+    int startBar
+    float entry
+    float stop
+    float target
+    box rewardBox
+    box riskBox
+    line entryLine
+    line stopLine
+    line targetLine
+    label entryLabel
+    label stopLabel
+    label targetLabel
+    string outcome
+
+var array<TradeFrame> frames = array.new<TradeFrame>()
+f_price(float value) =>
+    str.tostring(value, format.mintick)
+
+bool stopEvent = false
+bool targetEvent = false
+bool oppositeEvent = false
+
+if barstate.isconfirmed
+    // Finish the preceding frame before building a new one. Never test the
+    // entry candle's earlier wick against a stop established at its close.
+    if array.size(frames) > 0
+        previous = array.get(frames, array.size(frames) - 1)
+        if previous.outcome == "OPEN" and bar_index > previous.startBar
+            hitStop = previous.side == 1 ? low <= previous.stop : high >= previous.stop
+            hitTarget = previous.side == 1 ? high >= previous.target : low <= previous.target
+            oppositeCross = previous.side == 1 ? putSignal : callSignal
+            string result = hitStop ? (hitTarget ? "SL (BOTH TOUCHED)" : "SL TOUCHED") : hitTarget ? "TP TOUCHED" : oppositeCross ? "OPPOSITE CROSS" : "OPEN"
+            if result != "OPEN"
+                previous.outcome := result
+                stopEvent := hitStop
+                targetEvent := not hitStop and hitTarget
+                oppositeEvent := not hitStop and not hitTarget and oppositeCross
+                label.set_text(previous.entryLabel, (previous.side == 1 ? "CALL" : "PUT") + " ENTRY " + f_price(previous.entry) + "\n" + result)
+                label.set_color(previous.entryLabel, color.gray)
+                // Freeze completed boxes; retain their exact original levels.
+                finishBar = math.max(previous.startBar + 4, bar_index)
+                box.set_right(previous.rewardBox, finishBar)
+                box.set_right(previous.riskBox, finishBar)
+                line.set_x2(previous.entryLine, finishBar)
+                line.set_x2(previous.stopLine, finishBar)
+                line.set_x2(previous.targetLine, finishBar)
+                label.set_x(previous.entryLabel, finishBar)
+                label.set_x(previous.stopLabel, finishBar)
+                label.set_x(previous.targetLabel, finishBar)
+
+    if callSignal or putSignal
+        int side = callSignal ? 1 : -1
+        float entry = math.round_to_mintick(close)
+        float rawStop = side == 1 ? math.min(recentLow - atrValue * stopBufferATR, entry - atrValue * minimumRiskATR) : math.max(recentHigh + atrValue * stopBufferATR, entry + atrValue * minimumRiskATR)
+        float stop = math.round_to_mintick(rawStop)
+        float risk = math.max(math.abs(entry - stop), syminfo.mintick)
+        float target = math.round_to_mintick(entry + side * risk * rewardR)
+        int rightEdge = bar_index + frameBars
+        string direction = side == 1 ? "CALL" : "PUT"
+        string strikeText = "ATM REFERENCE " + str.tostring(math.round(entry), "#") + (side == 1 ? "C" : "P") + " | " + str.tostring(contracts) + " contracts"
+        reward = box.new(left=bar_index, top=math.max(entry, target), right=rightEdge, bottom=math.min(entry, target), border_color=color.teal, border_width=2, bgcolor=color.new(color.teal, 78), text="TAKE PROFIT " + f_price(target) + " | " + str.tostring(rewardR, "#.##") + "R", text_color=color.teal, text_size=size.normal, text_halign=text.align_right, text_valign=side == 1 ? text.align_top : text.align_bottom)
+        danger = box.new(left=bar_index, top=math.max(entry, stop), right=rightEdge, bottom=math.min(entry, stop), border_color=color.red, border_width=2, bgcolor=color.new(color.red, 83), text="STOP LOSS " + f_price(stop), text_color=color.red, text_size=size.normal, text_halign=text.align_right, text_valign=side == 1 ? text.align_bottom : text.align_top)
+        entryLine = line.new(bar_index, entry, rightEdge, entry, color=color.blue, width=3)
+        stopLine = line.new(bar_index, stop, rightEdge, stop, color=color.red, width=2)
+        targetLine = line.new(bar_index, target, rightEdge, target, color=color.teal, width=2)
+        entryLabel = label.new(rightEdge, entry, direction + " ENTRY " + f_price(entry) + "\n" + strikeText, style=label.style_label_left, color=color.blue, textcolor=color.white, size=size.normal)
+        stopLabel = label.new(rightEdge, stop, "SL " + f_price(stop), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.normal)
+        targetLabel = label.new(rightEdge, target, "TP " + f_price(target), style=label.style_label_left, color=color.teal, textcolor=color.white, size=size.normal)
+        array.push(frames, TradeFrame.new(side, bar_index, entry, stop, target, reward, danger, entryLine, stopLine, targetLine, entryLabel, stopLabel, targetLabel, "OPEN"))
+
+    while array.size(frames) > keepFrames
+        old = array.shift(frames)
+        box.delete(old.rewardBox)
+        box.delete(old.riskBox)
+        line.delete(old.entryLine)
+        line.delete(old.stopLine)
+        line.delete(old.targetLine)
+        label.delete(old.entryLabel)
+        label.delete(old.stopLabel)
+        label.delete(old.targetLabel)
+
+// Extend only the newest open frame, without moving its entry/stop/target.
+if array.size(frames) > 0
+    latest = array.get(frames, array.size(frames) - 1)
+    if latest.outcome == "OPEN"
+        rightEdge = bar_index + frameBars
+        box.set_right(latest.rewardBox, rightEdge)
+        box.set_right(latest.riskBox, rightEdge)
+        line.set_x2(latest.entryLine, rightEdge)
+        line.set_x2(latest.stopLine, rightEdge)
+        line.set_x2(latest.targetLine, rightEdge)
+        label.set_x(latest.entryLabel, rightEdge)
+        label.set_x(latest.stopLabel, rightEdge)
+        label.set_x(latest.targetLabel, rightEdge)
+
+var table panel = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 12), border_width=1)
+if barstate.islast and showContext
+    table.cell(panel, 0, 0, "EMA CROSS FRAMES", text_color=color.white)
+    table.cell(panel, 1, 0, str.tostring(fastLength) + " / " + str.tostring(slowLength), text_color=color.aqua)
+    table.cell(panel, 0, 1, "EMA50 / VWAP", text_color=color.white)
+    table.cell(panel, 1, 1, (close > trend ? "ABOVE" : "BELOW") + " / " + (close > vwapPrice ? "ABOVE" : "BELOW"), text_color=color.white)
+    table.cell(panel, 0, 2, "Closed 15m / 60m bias", text_color=color.white)
+    table.cell(panel, 1, 2, (close15 > ema15TF ? "BULL" : "BEAR") + " / " + (close60 > ema60TF ? "BULL" : "BEAR"), text_color=color.white)
+    table.cell(panel, 0, 3, "Relative volume (OHLCV)", text_color=color.white)
+    table.cell(panel, 1, 3, str.tostring(rvol, "#.##"), text_color=color.white)
+    table.cell(panel, 0, 4, "LATEST SIGNAL", text_color=color.white)
+    table.cell(panel, 0, 5, "SPY ENTRY", text_color=color.white)
+    table.cell(panel, 0, 6, "STOP LOSS", text_color=color.white)
+    table.cell(panel, 0, 7, "TAKE PROFIT", text_color=color.white)
+    table.cell(panel, 0, 8, "FRAME STATUS", text_color=color.white)
+    table.cell(panel, 0, 9, "OPTION REFERENCE", text_color=color.white)
+    table.cell(panel, 0, 10, "AUTOMATION", text_color=color.white)
+    table.cell(panel, 1, 10, "OFF — CHART ONLY", text_color=color.orange)
+    if array.size(frames) > 0
+        latest = array.get(frames, array.size(frames) - 1)
+        table.cell(panel, 1, 4, latest.side == 1 ? "CALL" : "PUT", text_color=latest.side == 1 ? color.lime : color.red)
+        table.cell(panel, 1, 5, f_price(latest.entry), text_color=color.aqua)
+        table.cell(panel, 1, 6, f_price(latest.stop), text_color=color.red)
+        table.cell(panel, 1, 7, f_price(latest.target), text_color=color.lime)
+        table.cell(panel, 1, 8, latest.outcome, text_color=color.white)
+        table.cell(panel, 1, 9, str.tostring(math.round(latest.entry), "#") + (latest.side == 1 ? "C" : "P") + " x " + str.tostring(contracts), text_color=color.white)
+    else
+        table.cell(panel, 1, 4, "WAIT CLOSED CROSS", text_color=color.orange)
+
+alertcondition(callSignal, "EMA CALL cross — chart signal", "Confirmed fast/slow EMA bullish cross; inspect CALL entry/SL/TP frame.")
+alertcondition(putSignal, "EMA PUT cross — chart signal", "Confirmed fast/slow EMA bearish cross; inspect PUT entry/SL/TP frame.")
+alertcondition(stopEvent, "SPY frame stop touched", "Modeled SPY stop touched; not an option fill confirmation.")
+alertcondition(targetEvent, "SPY frame target touched", "Modeled SPY target touched; not an option fill confirmation.")
+alertcondition(oppositeEvent, "SPY frame opposite-cross exit", "Opposite EMA cross closed the preceding modeled SPY frame.")
