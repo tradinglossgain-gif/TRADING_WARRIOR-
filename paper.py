@@ -159,13 +159,10 @@ def initialize(db):
         contract TEXT, buy_id TEXT NOT NULL UNIQUE, sell_id TEXT NOT NULL UNIQUE,
         submitted_at TEXT, exit_requested INTEGER NOT NULL DEFAULT 0,
         last_error TEXT, updated_at TEXT NOT NULL,
-        filled_quantity INTEGER NOT NULL DEFAULT 0,
-        closed_quantity INTEGER NOT NULL DEFAULT 0)""")
+        filled_quantity INTEGER NOT NULL DEFAULT 0)""")
     columns = {row[1] for row in db.execute("PRAGMA table_info(paper_trades)")}
     if "filled_quantity" not in columns:
         db.execute("ALTER TABLE paper_trades ADD COLUMN filled_quantity INTEGER NOT NULL DEFAULT 0")
-    if "closed_quantity" not in columns:
-        db.execute("ALTER TABLE paper_trades ADD COLUMN closed_quantity INTEGER NOT NULL DEFAULT 0")
 
 
 def enqueue(db, trade_id, canonical, now):
@@ -220,7 +217,7 @@ class PaperWorker:
         trade_id, state = row["trade_id"], row["state"]
         local = now.astimezone(NY)
         # Server-side cutoff remains effective if an exit webhook is lost.
-        cutoff = (local.hour * 100 + local.minute >= 1400
+        cutoff = (local.hour * 100 + local.minute >= 1559
                   or datetime.fromisoformat(json.loads(row["payload"])["timestamp"].replace("Z", "+00:00")).astimezone(NY).date() < local.date())
         paused = Path(self.settings.kill_file).exists()
         want_exit = bool(row["exit_requested"] or cutoff or paused)
@@ -260,24 +257,17 @@ class PaperWorker:
                     self.update(trade_id, state="BUY_CANCELLING", filled_quantity=filled)
                     self.broker.cancel(row["buy_id"])
             elif state == "FILLED" and want_exit:
-                self.update(trade_id, state="SELL_SUBMITTING", submitted_at=now.isoformat())
+                self.update(trade_id, state="SELL_SUBMITTING")
                 self.broker.place(json.loads(row["contract"]), row["sell_id"], "SELL",
                                   int(row["filled_quantity"]))
                 self.update(trade_id, state="SELL_PENDING", last_error=None)
-            elif state in {"SELL_SUBMITTING", "SELL_PENDING", "SELL_CANCELLING"}:
+            elif state in {"SELL_SUBMITTING", "SELL_PENDING"}:
                 quantity = int(row["filled_quantity"])
                 status, filled = self.broker.detail(row["sell_id"], "SELL", quantity)
                 if status == "FILLED" and filled == quantity:
-                    self.update(trade_id, state="CLOSED", closed_quantity=filled, last_error=None)
+                    self.update(trade_id, state="CLOSED", last_error=None)
                 elif status in {"CANCELLED", "FAILED"}:
-                    if filled == quantity:
-                        self.update(trade_id, state="CLOSED", closed_quantity=filled, last_error=None)
-                    else:
-                        self.update(trade_id, state="BLOCKED", closed_quantity=filled,
-                                    last_error="EXIT_REQUIRES_RECONCILIATION")
-                elif state == "SELL_CANCELLING" or status == "PARTIAL_FILLED" or (now - datetime.fromisoformat(row["submitted_at"])).total_seconds() >= 60:
-                    self.update(trade_id, state="SELL_CANCELLING", closed_quantity=filled)
-                    self.broker.cancel(row["sell_id"])
+                    self.update(trade_id, state="BLOCKED", last_error="EXIT_REQUIRES_RECONCILIATION")
         except Exception as error:
             safe_error = str(error) if isinstance(error, BrokerError) else "BROKER_CHECK_FAILED"
             if state == "PREPARE":
