@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -144,6 +145,16 @@ def create_app(settings: Settings, clock=None, broker=None):
                 worker = PaperWorker(settings, client, clock)
                 api.state.paper_worker = worker
                 worker.start()
+                if broker is None:
+                    def selftest():
+                        try:
+                            now = clock()
+                            c = client.prepare({"entry": 770, "direction": "PUT", "timestamp": now.isoformat()},
+                                               "SELFTEST" + uuid.uuid4().hex[:12], now)
+                            api.state.selftest = f"PREVIEW_OK {c['symbol']} limit={c['limit']}"
+                        except Exception as exc:
+                            api.state.selftest = f"FAILED {type(exc).__name__}: {str(exc)[:120]}" if exc.__class__.__name__ == "BrokerError" else f"FAILED {type(exc).__name__}"
+                    threading.Thread(target=selftest, daemon=True).start()
             except Exception:
                 raise RuntimeError("Paper worker startup failed; verify sandbox credentials and account configuration") from None
         try:
@@ -166,6 +177,7 @@ def create_app(settings: Settings, clock=None, broker=None):
                 "paused": Path(settings.kill_file).exists(), "worker_running": running,
                 "paper_states": state_counts, "last_skip_reason": last_skip[0] if last_skip else None,
                 "paper_reconciliation_required": errors > 0,
+                "selftest": getattr(api.state, "selftest", "pending"),
                 "schwab_worker_running": False, "schwab_states": {},
                 "schwab_reconciliation_required": False,
                 "contract_policy": "SPY_0DTE_ATM", "paper_quantity": settings.paper_quantity,
