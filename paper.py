@@ -202,7 +202,25 @@ class PaperWorker:
                 pass
             self.stop_event.wait(5)
 
+    def notify(self, trade_id, changes):
+        topic = os.environ.get("NTFY_TOPIC", "").strip()
+        state = changes.get("state")
+        labels = {"BUY_PENDING": "ORDER SENT to Webull paper", "FILLED": "ORDER FILLED",
+                  "CLOSED": "TRADE CLOSED", "SKIPPED": "SIGNAL SKIPPED", "BLOCKED": "NEEDS ATTENTION"}
+        if not topic or state not in labels:
+            return
+        text = labels[state] + f" - {trade_id}" + (f" ({changes['last_error']})" if changes.get("last_error") else "")
+        def send():
+            try:
+                import urllib.request
+                urllib.request.urlopen(urllib.request.Request(
+                    f"https://ntfy.sh/{topic}", data=text.encode(), headers={"Title": "SPY paper bot"}), timeout=5).close()
+            except Exception:
+                pass
+        threading.Thread(target=send, daemon=True).start()
+
     def update(self, trade_id, **changes):
+        self.notify(trade_id, changes)
         changes["updated_at"] = self.clock().isoformat()
         with sqlite3.connect(self.settings.database, timeout=2) as db:
             columns = ",".join(f"{name}=?" for name in changes)
