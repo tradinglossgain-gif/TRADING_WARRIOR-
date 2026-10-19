@@ -71,7 +71,7 @@ def checked_quote(data, contract, now, premium_cap):
     age = now.timestamp() - int(item["quote_time"]) / 1000
     ask, bid = Decimal(str(item["ask"])), Decimal(str(item["bid"]))
     if not -5 <= age <= 30 or not ask.is_finite() or not bid.is_finite() or not 0 < bid <= ask:
-        raise BrokerError("INVALID_OR_STALE_QUOTE")
+        raise BrokerError(f"INVALID_OR_STALE_QUOTE age={age:.0f}s bid={bid} ask={ask}")
     if Decimal(str(item["strike_price"])) != Decimal(contract["strike"]):
         raise BrokerError("CONTRACT_MISMATCH")
     # Buy at the observed ask, rounded up to a cent; never use underlying levels as premiums.

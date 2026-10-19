@@ -159,11 +159,13 @@ def create_app(settings: Settings, clock=None, broker=None):
         with sqlite3.connect(settings.database) as db:
             state_counts = dict(db.execute("SELECT state,COUNT(*) FROM paper_trades GROUP BY state").fetchall())
             errors = db.execute("SELECT COUNT(*) FROM paper_trades WHERE last_error IS NOT NULL AND state NOT IN ('CLOSED','SKIPPED')").fetchone()[0]
+            last_skip = db.execute("SELECT last_error FROM paper_trades WHERE state='SKIPPED' ORDER BY rowid DESC LIMIT 1").fetchone()
         running = bool(worker and worker.thread and worker.thread.is_alive())
         return {"status": "ok", "mode": mode, "broker_orders_enabled": settings.paper_enabled and running,
                 "schwab_broker_orders_enabled": False,
                 "paused": Path(settings.kill_file).exists(), "worker_running": running,
-                "paper_states": state_counts, "paper_reconciliation_required": errors > 0,
+                "paper_states": state_counts, "last_skip_reason": last_skip[0] if last_skip else None,
+                "paper_reconciliation_required": errors > 0,
                 "schwab_worker_running": False, "schwab_states": {},
                 "schwab_reconciliation_required": False,
                 "contract_policy": "SPY_0DTE_ATM", "paper_quantity": settings.paper_quantity,
