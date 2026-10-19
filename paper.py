@@ -69,8 +69,11 @@ def checked_quote(data, contract, now, premium_cap):
         raise BrokerError("ATM_CONTRACT_UNAVAILABLE")
     item = matches[0]
     age = now.timestamp() - int(item["quote_time"]) / 1000
+    # The Webull sandbox serves delayed option quotes and reports the delay; allow exactly that much extra age.
+    delay = item.get("delay_minutes")
+    max_age = 30 + (int(delay) * 60 + 60 if isinstance(delay, (int, str)) and str(delay).isdigit() and 0 < int(delay) <= 20 else 0)
     ask, bid = Decimal(str(item["ask"])), Decimal(str(item["bid"]))
-    if not -5 <= age <= 30 or not ask.is_finite() or not bid.is_finite() or not 0 < bid <= ask:
+    if not -5 <= age <= max_age or not ask.is_finite() or not bid.is_finite() or not 0 < bid <= ask:
         raise BrokerError(f"INVALID_OR_STALE_QUOTE age={age:.0f}s bid={bid} ask={ask}")
     if Decimal(str(item["strike_price"])) != Decimal(contract["strike"]):
         raise BrokerError("CONTRACT_MISMATCH")
