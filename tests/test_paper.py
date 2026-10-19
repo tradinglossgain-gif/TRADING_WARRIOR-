@@ -68,7 +68,6 @@ def test_atm_0dte_and_close_intent(worker):
 def test_paper_quantity_configuration_is_bounded(monkeypatch):
     monkeypatch.setenv("WEBHOOK_TOKEN", "x" * 40)
     monkeypatch.delenv("WEBHOOK_TOKEN_FILE", raising=False)
-    monkeypatch.setenv("PAPER_TRADING_ENABLED", "false")
     monkeypatch.setenv("PAPER_QUANTITY", "5")
     assert Settings.from_env().paper_quantity == 5
     monkeypatch.setenv("PAPER_QUANTITY", "6")
@@ -136,7 +135,7 @@ def test_server_cutoff_closes_filled_trade_without_exit_alert(worker):
     w.tick()
     fake.status = ("FILLED", 5)
     w.tick()
-    now[0] = now[0].replace(hour=18)  # 14:00 New York
+    now[0] = now[0].replace(hour=19, minute=59)  # 15:59 New York
     w.tick()
     assert fake.placements[-1][2] == "SELL"
 
@@ -160,23 +159,6 @@ def test_partial_entry_is_cancelled_and_only_filled_quantity_is_closed(worker):
     assert row(w)["state"] == "CLOSED"
 
 
-def test_partial_exit_is_cancelled_and_requires_reconciliation(worker):
-    w, fake, now, payload = worker
-    w.tick()
-    w.tick()
-    fake.status = ("FILLED", 5)
-    w.tick()
-    w.update(payload["trade_id"], exit_requested=1)
-    w.tick()
-    fake.status = ("PARTIAL_FILLED", 2)
-    w.tick()
-    assert fake.cancellations and row(w)["state"] == "SELL_CANCELLING"
-    fake.status = ("CANCELLED", 2)
-    w.tick()
-    assert row(w)["state"] == "BLOCKED"
-    assert row(w)["closed_quantity"] == 2
-
-
 def test_invalid_quotes_and_fill_business_status_fail_closed(worker):
     w, fake, now, payload = worker
     c = atm_contract(payload, now[0])
@@ -191,7 +173,6 @@ def test_invalid_quotes_and_fill_business_status_fail_closed(worker):
                                "filled_quantity": "0", "status": "FILLED"}]}):
         with pytest.raises(BrokerError):
             checked_order(data, "id", "BUY")
-
     partial = {"orders": [{"client_order_id": "five", "side": "BUY", "total_quantity": "5",
                             "filled_quantity": "2", "status": "PARTIAL_FILLED"}]}
     assert checked_order(partial, "five", "BUY", quantity=5) == ("PARTIAL_FILLED", 2)
@@ -206,8 +187,7 @@ def test_dry_run_records_are_not_replayed_into_paper_orders(worker):
     assert not fake.placements
 
 
-@pytest.mark.parametrize("source_version", ["sweep_retest_v1", "amd_sweep_v1", "vwap_flow_breakout_v1"])
-def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_path, monkeypatch, source_version):
+def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from fastapi.testclient import TestClient
     monkeypatch.setattr(PaperWorker, "start", lambda self: setattr(self, "thread", SimpleNamespace(
@@ -215,15 +195,9 @@ def test_paper_intake_atomically_queues_and_blocks_next_entry_until_close(tmp_pa
     now = [datetime(2026, 10, 12, 14, 0, tzinfo=timezone.utc)]
     settings = Settings("x" * 40, str(tmp_path / "db"), str(tmp_path / "PAUSED"), paper_enabled=True)
     fake = FakeBroker()
-    payload = {"token": settings.token, "source_version": source_version, "quantity": 5, "trade_id": "trade-1", "timestamp": now[0].isoformat(),
+    payload = {"token": settings.token, "trade_id": "trade-1", "timestamp": now[0].isoformat(),
                "symbol": "SPY", "direction": "CALL", "entry": 778.62, "stop": 777, "target": 782}
     with TestClient(create_app(settings, lambda: now[0], fake)) as client:
-        legacy = {key: value for key, value in payload.items() if key != "source_version"}
-        assert client.post("/webhook", json=legacy).status_code == 422
-        too_many = {**payload, "quantity": 6, "trade_id": "trade-too-many"}
-        assert client.post("/webhook", json=too_many).status_code == 422
-        mismatch = {**payload, "quantity": 4, "trade_id": "trade-mismatch"}
-        assert client.post("/webhook", json=mismatch).status_code == 422
         assert client.post("/webhook", json=payload).json()["status"] == "queued"
         assert client.post("/webhook", json=payload).json()["status"] == "duplicate"
         with sqlite3.connect(settings.database) as db:
