@@ -1,0 +1,411 @@
+//@version=6
+indicator("SPY Structure + Macro Context v28 | ENTRY / SL / TP", overlay=true, max_boxes_count=100, max_lines_count=150, max_labels_count=200)
+// Based on the supplied reclaim / rejection -> structure break -> entry framework.
+// No historical example price is hard-coded. OHLCV does not identify real order flow.
+
+g1 = "1 — Setup rules (SPY 1-minute chart)"
+entryStyle = input.string("Breakout or Retest", "Entry confirmation", options=["Breakout or Retest", "Retest only"], group=g1)
+pivotBars = input.int(3, "Confirmed swing left/right bars", minval=2, maxval=10, group=g1)
+expiryBars = input.int(15, "Bars allowed after reclaim / rejection", minval=3, maxval=60, group=g1)
+bodyATR = input.float(0.4, "Structure-break body minimum (ATR)", minval=0, step=0.1, group=g1)
+minRVOL = input.float(0.8, "Structure-break minimum relative volume", minval=0, step=0.1, group=g1)
+retestATR = input.float(0.15, "Structure retest tolerance (ATR)", minval=0, step=0.05, group=g1)
+requireVWAP = input.bool(true, "Entry requires session VWAP alignment", group=g1)
+require5m = input.bool(false, "Also require completed 5m trend alignment", group=g1)
+entrySession = input.session("0940-1550", "Entry window — New York", group=g1)
+flatHour = input.int(15, "Chart force-exit hour — New York", minval=0, maxval=23, group=g1)
+flatMinute = input.int(55, "Chart force-exit minute", minval=0, maxval=59, group=g1)
+maxEntries = input.int(6, "Maximum accepted setups per day", minval=1, maxval=30, group=g1)
+
+g2 = "2 — Structure stop and opposing targets"
+stopBuffer = input.float(0.1, "Buffer beyond invalidating wick (ATR)", minval=0, step=0.05, group=g2)
+minStopATR = input.float(0.5, "Minimum initial risk (ATR)", minval=0.1, step=0.1, group=g2)
+maxStopATR = input.float(3.0, "Reject initial risk above (ATR)", minval=0.5, step=0.25, group=g2)
+minimumRR = input.float(1.5, "Minimum final target reward/risk", minval=1, step=0.25, group=g2)
+fallbackRR = input.float(2.5, "Final R target if no opposing level", minval=1, step=0.25, group=g2)
+maximumRR = input.float(3.0, "Maximum final R target", minval=1, step=0.25, group=g2)
+targetBuffer = input.float(0.05, "Take profit before opposing level (ATR)", minval=0, step=0.05, group=g2)
+manualSupport = input.float(0, "Extra known support (0 = off)", minval=0, group=g2)
+manualResistance = input.float(0, "Extra known resistance (0 = off)", minval=0, group=g2)
+
+g3 = "3 — Fundamentals and macro (explicit inputs)"
+useMacro = input.bool(false, "Require dated reviewed macro/news bias", group=g3)
+macroBias = input.string("Neutral", "Reviewed CPI / Fed / earnings / headline bias", options=["Neutral", "Bullish", "Bearish", "No trade"], group=g3)
+macroFrom = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Bias valid from", group=g3)
+macroUntil = input.time(timestamp("02 Jan 2026 00:00 +0000"), "Bias valid until", group=g3)
+useEvent = input.bool(false, "Exclude a dated scheduled-event interval", group=g3)
+eventFrom = input.time(timestamp("01 Jan 2026 13:20 +0000"), "Event exclusion starts", group=g3)
+eventUntil = input.time(timestamp("01 Jan 2026 14:00 +0000"), "Event exclusion ends", group=g3)
+yieldSymbol = input.symbol("TVC:US10Y", "10-year yield symbol (quoted in percent)", group=g3)
+useYield = input.bool(false, "Block longs on yield spike / shorts on yield drop", group=g3)
+yieldThreshold = input.float(3, "15-minute yield-change threshold (basis points)", minval=0.5, step=0.5, group=g3)
+// Dated manual bias is not a live news/calendar/earnings-surprise data feed.
+// Yield and sector ETFs are context proxies, NOT a fundamentals or breadth feed.
+
+g4 = "4 — Clear frames"
+keepFrames = input.int(8, "Frames to keep", minval=1, maxval=20, group=g4)
+frameBars = input.int(12, "Frame right margin (bars)", minval=4, maxval=60, group=g4)
+showLevels = input.bool(true, "Show previous-day and premarket levels", group=g4)
+showStages = input.bool(true, "Mark reclaim / rejection and structure break", group=g4)
+showRejected = input.bool(true, "Label rejected entry reason", group=g4)
+showFVG = input.bool(false, "Show latest confirmed 3-candle FVGs (context only)", group=g4)
+
+g5 = "5 — Optional PAPER webhook JSON"
+enableWebhook = input.bool(false, "Enable paper webhook JSON alerts", group=g5)
+webhookToken = input.string("", "Private WEBHOOK_TOKEN (never share in screenshots)", group=g5)
+contracts = input.int(5, "Paper option contracts", minval=1, maxval=20, group=g5)
+paperSession = input.session("0945-1355", "Paper JSON entry window — New York", group=g5)
+paperFlatHour = input.int(14, "Paper JSON cutoff hour — match receiver", minval=0, maxval=23, group=g5)
+paperFlatMinute = input.int(0, "Paper JSON cutoff minute", minval=0, maxval=59, group=g5)
+// Routing URL belongs in TradingView alert Notifications, not this token field.
+// Receiver must explicitly support source_version structure_v28 and quantity.
+
+if syminfo.ticker != "SPY" or not timeframe.isminutes or timeframe.multiplier != 1
+    runtime.error("Run this indicator on standard SPY 1-minute candles. Completed 5m / 30m / 4h context is requested internally.")
+if fallbackRR < minimumRR or maximumRR < fallbackRR or maxStopATR < minStopATR
+    runtime.error("Use minimum R <= fallback R <= maximum R, and maximum stop >= minimum stop.")
+if useMacro and macroUntil <= macroFrom
+    runtime.error("Macro validity end must follow its start.")
+if useEvent and eventUntil <= eventFrom
+    runtime.error("Event exclusion end must follow its start.")
+if enableWebhook and (str.length(webhookToken) < 32 or str.length(webhookToken) > 256 or str.contains(webhookToken, "\n") or str.contains(webhookToken, "\r") or str.contains(webhookToken, "\t"))
+    runtime.error("Enter a private 32–256 character WEBHOOK_TOKEN with no line breaks before enabling JSON alerts.")
+
+f_price(float p) =>
+    str.tostring(p, format.mintick)
+f_bias(float price, float average) =>
+    na(price) or na(average) ? "N/A" : price > average ? "BULL" : "BEAR"
+f_escape(string s) =>
+    str.replace_all(str.replace_all(s, "\\", "\\\\"), "\"", "\\\"")
+f_payload(string id, string action, int side, float entry, float stop, float target, int qty) =>
+    "{\"token\":\"" + f_escape(webhookToken) + "\",\"trade_id\":\"" + id + "\",\"source_version\":\"structure_v28\",\"action\":\"" + action + "\",\"timestamp\":\"" + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + "\",\"symbol\":\"SPY\",\"direction\":\"" + (side == 1 ? "CALL" : "PUT") + "\",\"entry\":" + f_price(entry) + ",\"stop\":" + f_price(stop) + ",\"target\":" + f_price(target) + ",\"quantity\":" + str.tostring(qty) + "}"
+
+atr = ta.atr(14)
+fast = ta.ema(close, 10)
+slow = ta.ema(close, 20)
+vwapPrice = ta.vwap(hlc3)
+volMean = ta.sma(volume, 20)
+rvol = volMean > 0 ? volume / volMean : na
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[c5, e5] = request.security(syminfo.tickerid, "5", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+[c30, e30] = request.security(syminfo.tickerid, "30", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+[c4h, e4h] = request.security(syminfo.tickerid, "240", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+[yieldNow, yieldBefore] = request.security(yieldSymbol, "5", [close[1], close[4]], lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+yieldBps = (yieldNow - yieldBefore) * 100
+xlkReturn = request.security("AMEX:XLK", "5", close[1] / close[4] - 1, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+xlfReturn = request.security("AMEX:XLF", "5", close[1] / close[4] - 1, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+xlyReturn = request.security("AMEX:XLY", "5", close[1] / close[4] - 1, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+sectorData = not na(xlkReturn) and not na(xlfReturn) and not na(xlyReturn)
+positiveSectors = (xlkReturn > 0 ? 1 : 0) + (xlfReturn > 0 ? 1 : 0) + (xlyReturn > 0 ? 1 : 0)
+
+string TZ = "America/New_York"
+newDay = ta.change(time("D", "0000-2359:1234567", TZ)) != 0
+inPremarket = not na(time(timeframe.period, "0400-0930:23456", TZ))
+inEntry = not na(time(timeframe.period, entrySession, TZ))
+inPaperSession = not na(time(timeframe.period, paperSession, TZ))
+paperCutoff = hour(time_close, TZ) * 60 + minute(time_close, TZ) >= paperFlatHour * 60 + paperFlatMinute
+cutoff = hour(time_close, TZ) * 60 + minute(time_close, TZ) >= flatHour * 60 + flatMinute
+var float pmHigh = na
+var float pmLow = na
+var int entriesToday = 0
+var float lastHigh = na
+var float lastLow = na
+if newDay
+    pmHigh := na
+    pmLow := na
+    entriesToday := 0
+    lastHigh := na
+    lastLow := na
+if inPremarket
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow := na(pmLow) ? low : math.min(pmLow, low)
+ph = ta.pivothigh(high, pivotBars, pivotBars)
+pl = ta.pivotlow(low, pivotBars, pivotBars)
+if barstate.isconfirmed
+    if not na(ph)
+        lastHigh := ph
+    if not na(pl)
+        lastLow := pl
+
+// All levels are known by this bar's close. Previous close is a reclaim level,
+// not a previous-low sweep. Daily/weekly values use previous completed candles.
+array<float> highs = array.from(pdh, pwh, pmHigh, lastHigh, manualResistance > 0 ? manualResistance : na)
+array<float> lows = array.from(pdl, pwl, pmLow, lastLow, manualSupport > 0 ? manualSupport : na)
+float reclaimed = na
+float rejected = na
+float nextHigh = na
+float nextLow = na
+for level in lows
+    if not na(level) and low < level - syminfo.mintick and close > level
+        reclaimed := na(reclaimed) ? level : math.max(reclaimed, level)
+    if not na(level) and level < close
+        nextLow := na(nextLow) ? level : math.max(nextLow, level)
+for level in highs
+    if not na(level) and high > level + syminfo.mintick and close < level
+        rejected := na(rejected) ? level : math.min(rejected, level)
+    if not na(level) and level > close
+        nextHigh := na(nextHigh) ? level : math.min(nextHigh, level)
+if not na(pdc)
+    if low < pdc and close > pdc and close[1] <= pdc
+        reclaimed := na(reclaimed) ? pdc : math.max(reclaimed, pdc)
+    if high > pdc and close < pdc and close[1] >= pdc
+        rejected := na(rejected) ? pdc : math.min(rejected, pdc)
+    if pdc > close
+        nextHigh := na(nextHigh) ? pdc : math.min(nextHigh, pdc)
+    if pdc < close
+        nextLow := na(nextLow) ? pdc : math.max(nextLow, pdc)
+
+type Frame
+    int side
+    int start
+    float entry
+    float stop
+    float target
+    float tp1
+    float tp2
+    string basis
+    string status
+    string id
+    int qty
+    bool hooked
+    box reward
+    box risk
+    line entryLine
+    line stopLine
+    line tp1Line
+    line tp2Line
+    line targetLine
+    label entryLabel
+    label stopLabel
+    label tp1Label
+    label tp2Label
+    label targetLabel
+
+var array<Frame> frames = array.new<Frame>()
+var array<label> rejectLabels = array.new<label>()
+var Frame active = na
+var int bullStage = 0
+var int bearStage = 0
+var int bullBar = na
+var int bearBar = na
+var float bullBreak = na
+var float bearBreak = na
+var float bullWick = na
+var float bearWick = na
+var string lastDecision = "WAIT LEVEL RECLAIM / REJECTION"
+bool bullReclaim = false
+bool bearRejection = false
+bool bullBOS = false
+bool bearBOS = false
+bool callSignal = false
+bool putSignal = false
+bool stopExit = false
+bool targetExit = false
+
+// Manage an existing frame before considering a later entry. Never apply an
+// entry-candle wick to a trade established at that candle's close.
+bool occupiedAtStart = not na(active)
+if barstate.isconfirmed
+    if not na(active) and bar_index > active.start
+        bool hitStop = active.side == 1 ? low <= active.stop : high >= active.stop
+        bool hitTarget = active.side == 1 ? high >= active.target : low <= active.target
+        string outcome = hitStop ? (hitTarget ? "SL — BOTH TOUCHED" : "SL TOUCHED") : hitTarget ? "FINAL TP TOUCHED" : newDay ? "SESSION EXPIRED" : cutoff ? "TIME EXIT" : "OPEN"
+        if outcome != "OPEN"
+            active.status := outcome
+            stopExit := hitStop
+            targetExit := not hitStop and hitTarget
+            label.set_text(active.entryLabel, (active.side == 1 ? "CALL" : "PUT") + " ENTRY " + f_price(active.entry) + "\n" + outcome)
+            label.set_color(active.entryLabel, color.gray)
+            if enableWebhook and active.hooked and barstate.isrealtime
+                string action = hitStop ? "EXIT_SL" : hitTarget ? "EXIT_TP" : "EXPIRE"
+                alert(f_payload(active.id, action, active.side, active.entry, active.stop, active.target, active.qty), alert.freq_once_per_bar_close)
+            active := na
+        else if enableWebhook and active.hooked and barstate.isrealtime and paperCutoff
+            // Broker time exit is independent of the later visual chart cutoff.
+            alert(f_payload(active.id, "EXPIRE", active.side, active.entry, active.stop, active.target, active.qty), alert.freq_once_per_bar_close)
+            active.hooked := false
+    if newDay or not inEntry or cutoff or occupiedAtStart
+        bullStage := 0
+        bearStage := 0
+    else
+        if bullStage > 0 and (bar_index - bullBar > expiryBars or low < bullWick)
+            bullStage := 0
+        if bearStage > 0 and (bar_index - bearBar > expiryBars or high > bearWick)
+            bearStage := 0
+        // Freeze the known break level and invalidating wick when arming.
+        if bullStage == 0 and not na(reclaimed) and not na(lastHigh[1]) and lastHigh[1] > close and close > open
+            bullStage := 1
+            bullBar := bar_index
+            bullBreak := lastHigh[1]
+            bullWick := low
+            bullReclaim := true
+        if bearStage == 0 and not na(rejected) and not na(lastLow[1]) and lastLow[1] < close and close < open
+            bearStage := 1
+            bearBar := bar_index
+            bearBreak := lastLow[1]
+            bearWick := high
+            bearRejection := true
+        bool displacement = math.abs(close - open) >= atr * bodyATR and (minRVOL == 0 or (not na(rvol) and rvol >= minRVOL))
+        bool bullReady = false
+        bool bearReady = false
+        if bullStage == 1 and bar_index > bullBar and close > bullBreak and close > open and displacement
+            bullStage := 2
+            bullBOS := true
+            bullReady := entryStyle == "Breakout or Retest"
+        else if bullStage == 2 and low <= bullBreak + atr * retestATR and close > bullBreak and close > open
+            bullReady := true
+        if bearStage == 1 and bar_index > bearBar and close < bearBreak and close < open and displacement
+            bearStage := 2
+            bearBOS := true
+            bearReady := entryStyle == "Breakout or Retest"
+        else if bearStage == 2 and high >= bearBreak - atr * retestATR and close < bearBreak and close < open
+            bearReady := true
+        if bullReady or bearReady
+            int side = bullReady ? 1 : -1
+            float wick = side == 1 ? bullWick : bearWick
+            float entry = math.round_to_mintick(close)
+            float stop = math.round_to_mintick(side == 1 ? math.min(wick - atr * stopBuffer, entry - atr * minStopATR) : math.max(wick + atr * stopBuffer, entry + atr * minStopATR))
+            float risk = math.abs(entry - stop)
+            float barrier = side == 1 ? nextHigh : nextLow
+            float unbounded = na(barrier) ? entry + side * risk * fallbackRR : barrier - side * atr * targetBuffer
+            float target = math.round_to_mintick(side == 1 ? math.min(unbounded, entry + risk * maximumRR) : math.max(unbounded, entry - risk * maximumRR))
+            float rr = side * (target - entry) / risk
+            bool macroValid = time_close >= macroFrom and time_close <= macroUntil
+            bool macroOK = not useMacro or (macroValid and (macroBias == "Neutral" or (side == 1 ? macroBias == "Bullish" : macroBias == "Bearish")))
+            bool eventBlocked = useEvent and time < eventUntil and time_close > eventFrom
+            bool vwapOK = not requireVWAP or (side == 1 ? close > vwapPrice : close < vwapPrice)
+            bool contextOK = not require5m or (side == 1 ? c5 > e5 : c5 < e5)
+            bool yieldOK = not useYield or (not na(yieldBps) and (side == 1 ? yieldBps <= yieldThreshold : yieldBps >= -yieldThreshold))
+            lastDecision := entriesToday >= maxEntries ? "DAILY LIMIT" : not macroOK ? "MACRO BIAS EXPIRED / OPPOSED" : eventBlocked ? "EVENT EXCLUSION" : not vwapOK ? "VWAP NOT ALIGNED" : not contextOK ? "CLOSED 5m NOT ALIGNED" : not yieldOK ? "YIELD MOVE / MISSING YIELD DATA" : na(risk) or risk <= 0 or risk > atr * maxStopATR ? "STRUCTURE STOP TOO DISTANT" : na(rr) or rr < minimumRR ? "OPPOSING LEVEL TOO CLOSE" : "ENTRY ACCEPTED"
+            if lastDecision == "ENTRY ACCEPTED"
+                float tp1 = math.round_to_mintick(entry + side * risk * math.min(1.0, rr * 0.5))
+                float tp2 = math.round_to_mintick(entry + side * risk * rr * 0.75)
+                string basis = na(barrier) ? "R FALLBACK — NO MAPPED LEVEL" : math.abs(target - entry) < math.abs(unbounded - entry) ? "R CAP BEFORE OPPOSING LEVEL" : "OPPOSING LEVEL"
+                int right = bar_index + frameBars
+                string id = "S28-" + str.tostring(time_close)
+                string direction = side == 1 ? "CALL" : "PUT"
+                reward = box.new(bar_index, math.max(entry, target), right, math.min(entry, target), border_color=color.teal, border_width=2, bgcolor=color.new(color.teal, 80), text="FINAL TP " + f_price(target) + " | " + str.tostring(rr, "#.##") + "R", text_color=color.teal, text_halign=text.align_right, text_valign=side == 1 ? text.align_top : text.align_bottom)
+                danger = box.new(bar_index, math.max(entry, stop), right, math.min(entry, stop), border_color=color.red, border_width=2, bgcolor=color.new(color.red, 83), text="STOP LOSS " + f_price(stop), text_color=color.red, text_halign=text.align_right, text_valign=side == 1 ? text.align_bottom : text.align_top)
+                el = line.new(bar_index, entry, right, entry, color=color.blue, width=3)
+                sl = line.new(bar_index, stop, right, stop, color=color.red, width=2)
+                t1 = line.new(bar_index, tp1, right, tp1, color=color.teal, style=line.style_dashed)
+                t2 = line.new(bar_index, tp2, right, tp2, color=color.teal, style=line.style_dashed)
+                tl = line.new(bar_index, target, right, target, color=color.teal, width=2)
+                le = label.new(right, entry, direction + " ENTRY " + f_price(entry) + "\nATM REF " + str.tostring(math.round(entry), "#") + (side == 1 ? "C" : "P") + " x " + str.tostring(contracts), style=label.style_label_left, color=color.blue, textcolor=color.white)
+                ls = label.new(right, stop, "SL " + f_price(stop), style=label.style_label_left, color=color.red, textcolor=color.white)
+                l1 = label.new(right, tp1, "TP1 " + f_price(tp1) + " (ADVISORY)", style=label.style_label_left, color=color.teal, textcolor=color.white)
+                l2 = label.new(right, tp2, "TP2 " + f_price(tp2) + " (ADVISORY)", style=label.style_label_left, color=color.teal, textcolor=color.white)
+                lt = label.new(right, target, "FINAL TP " + f_price(target), style=label.style_label_left, color=color.teal, textcolor=color.white)
+                bool hooked = enableWebhook and barstate.isrealtime and inPaperSession and not paperCutoff
+                active := Frame.new(side, bar_index, entry, stop, target, tp1, tp2, basis, "OPEN", id, contracts, hooked, reward, danger, el, sl, t1, t2, tl, le, ls, l1, l2, lt)
+                if enableWebhook and not hooked
+                    label.set_text(le, label.get_text(le) + "\nVISUAL ONLY — OUTSIDE PAPER WINDOW / HISTORICAL")
+                array.push(frames, active)
+                entriesToday += 1
+                callSignal := side == 1
+                putSignal := side == -1
+                bullStage := 0
+                bearStage := 0
+                if hooked
+                    alert(f_payload(id, "ENTRY", side, entry, stop, target, contracts), alert.freq_once_per_bar_close)
+            else if showRejected
+                rejection = label.new(bar_index, side == 1 ? low : high, lastDecision, style=side == 1 ? label.style_label_up : label.style_label_down, color=color.gray, textcolor=color.white, size=size.tiny)
+                array.push(rejectLabels, rejection)
+                if array.size(rejectLabels) > 20
+                    label.delete(array.shift(rejectLabels))
+
+if not na(active)
+    int right = bar_index + frameBars
+    box.set_right(active.reward, right)
+    box.set_right(active.risk, right)
+    line.set_x2(active.entryLine, right)
+    line.set_x2(active.stopLine, right)
+    line.set_x2(active.tp1Line, right)
+    line.set_x2(active.tp2Line, right)
+    line.set_x2(active.targetLine, right)
+    label.set_x(active.entryLabel, right)
+    label.set_x(active.stopLabel, right)
+    label.set_x(active.tp1Label, right)
+    label.set_x(active.tp2Label, right)
+    label.set_x(active.targetLabel, right)
+while array.size(frames) > keepFrames
+    old = array.shift(frames)
+    box.delete(old.reward)
+    box.delete(old.risk)
+    line.delete(old.entryLine)
+    line.delete(old.stopLine)
+    line.delete(old.tp1Line)
+    line.delete(old.tp2Line)
+    line.delete(old.targetLine)
+    label.delete(old.entryLabel)
+    label.delete(old.stopLabel)
+    label.delete(old.tp1Label)
+    label.delete(old.tp2Label)
+    label.delete(old.targetLabel)
+
+// Exact three-candle gaps are optional visual context, never compulsory
+// retest gates. A gap does not establish institutional orders or absorption.
+var box bullGap = na
+var box bearGap = na
+if showFVG and barstate.isconfirmed
+    if low > high[2]
+        if not na(bullGap)
+            box.delete(bullGap)
+        bullGap := box.new(bar_index - 2, low, bar_index + 12, high[2], border_color=color.new(color.teal, 60), bgcolor=color.new(color.teal, 92), text="BULL FVG — CONTEXT", text_color=color.teal, text_size=size.tiny)
+    if high < low[2]
+        if not na(bearGap)
+            box.delete(bearGap)
+        bearGap := box.new(bar_index - 2, low[2], bar_index + 12, high, border_color=color.new(color.red, 60), bgcolor=color.new(color.red, 92), text="BEAR FVG — CONTEXT", text_color=color.red, text_size=size.tiny)
+
+plot(fast, "EMA10 context", color=color.aqua)
+plot(slow, "EMA20 context", color=color.orange)
+plot(vwapPrice, "Session VWAP", color=color.purple, linewidth=2)
+plot(showLevels ? pdh : na, "PREVIOUS DAY HIGH", color=color.new(color.red, 25), style=plot.style_stepline)
+plot(showLevels ? pdl : na, "PREVIOUS DAY LOW", color=color.new(color.teal, 25), style=plot.style_stepline)
+plot(showLevels ? pdc : na, "PREVIOUS CLOSE — NOT PREVIOUS LOW", color=color.new(color.blue, 30), style=plot.style_stepline)
+plot(showLevels ? pmHigh : na, "PREMARKET HIGH", color=color.new(color.red, 55), style=plot.style_stepline)
+plot(showLevels ? pmLow : na, "PREMARKET LOW", color=color.new(color.teal, 55), style=plot.style_stepline)
+plotshape(showStages and bullReclaim, "Known-level reclaim", shape.triangleup, location.belowbar, color.teal, text="RECLAIM", size=size.tiny)
+plotshape(showStages and bearRejection, "Known-level rejection", shape.triangledown, location.abovebar, color.orange, text="REJECT", size=size.tiny)
+plotshape(showStages and bullBOS, "Bull structure break", shape.circle, location.belowbar, color.teal, text="BOS", size=size.tiny)
+plotshape(showStages and bearBOS, "Bear structure break", shape.circle, location.abovebar, color.red, text="BOS", size=size.tiny)
+plotshape(callSignal, "CALL ENTRY", shape.labelup, location.belowbar, color.teal, text="CALL", textcolor=color.white)
+plotshape(putSignal, "PUT ENTRY", shape.labeldown, location.abovebar, color.red, text="PUT", textcolor=color.white)
+
+var table panel = table.new(position.top_right, 2, 13, bgcolor=color.new(color.black, 12), border_width=1)
+if barstate.islast
+    string stage = not na(active) ? "TRACKING OPEN FRAME" : cutoff ? "CHART CUTOFF" : not inEntry ? "OUTSIDE ENTRY WINDOW" : bullStage == 2 or bearStage == 2 ? "WAIT STRUCTURE RETEST" : bullStage == 1 or bearStage == 1 ? "WAIT STRUCTURE BREAK" : "WAIT LEVEL RECLAIM / REJECTION"
+    table.cell(panel, 0, 0, "STRUCTURE v28", text_color=color.white)
+    table.cell(panel, 1, 0, stage, text_color=color.aqua)
+    table.cell(panel, 0, 1, "CLOSED 5m / 30m / 4h", text_color=color.white)
+    table.cell(panel, 1, 1, f_bias(c5, e5) + " / " + f_bias(c30, e30) + " / " + f_bias(c4h, e4h), text_color=color.white)
+    table.cell(panel, 0, 2, "VWAP / RVOL", text_color=color.white)
+    table.cell(panel, 1, 2, (close > vwapPrice ? "ABOVE" : "BELOW") + " / " + str.tostring(rvol, "#.00"), text_color=color.white)
+    table.cell(panel, 0, 3, "10Y CHANGE (15m, bps)", text_color=color.white)
+    table.cell(panel, 1, 3, na(yieldBps) ? "FEED UNAVAILABLE" : str.tostring(yieldBps, "#.0"), text_color=color.white)
+    table.cell(panel, 0, 4, "XLK/XLF/XLY — SECTOR PROXY", text_color=color.white)
+    table.cell(panel, 1, 4, sectorData ? str.tostring(positiveSectors) + " / 3 POSITIVE" : "FEED UNAVAILABLE", text_color=color.white)
+    table.cell(panel, 0, 5, "REVIEWED MACRO BIAS", text_color=color.white)
+    table.cell(panel, 1, 5, not useMacro ? "OFF — NO LIVE NEWS FEED" : time_close < macroFrom or time_close > macroUntil ? "EXPIRED / MISSING" : macroBias, text_color=color.orange)
+    table.cell(panel, 0, 6, "LAST DECISION", text_color=color.white)
+    table.cell(panel, 1, 6, lastDecision, text_color=color.white)
+    table.cell(panel, 0, 7, "LATEST ENTRY", text_color=color.white)
+    table.cell(panel, 0, 8, "STOP LOSS", text_color=color.white)
+    table.cell(panel, 0, 9, "TP1 / TP2 / FINAL", text_color=color.white)
+    table.cell(panel, 0, 10, "TARGET BASIS", text_color=color.white)
+    table.cell(panel, 0, 11, "STATUS", text_color=color.white)
+    table.cell(panel, 0, 12, "PAPER JSON", text_color=color.white)
+    table.cell(panel, 1, 12, enableWebhook ? (inPaperSession and not paperCutoff ? "ON — VERIFY RECEIVER" : "VISUAL ONLY — PAPER WINDOW CLOSED") : "OFF", text_color=color.orange)
+    if array.size(frames) > 0
+        latest = array.get(frames, array.size(frames) - 1)
+        table.cell(panel, 1, 7, (latest.side == 1 ? "CALL " : "PUT ") + f_price(latest.entry), text_color=color.aqua)
+        table.cell(panel, 1, 8, f_price(latest.stop), text_color=color.red)
+        table.cell(panel, 1, 9, f_price(latest.tp1) + " / " + f_price(latest.tp2) + " / " + f_price(latest.target), text_color=color.lime)
+        table.cell(panel, 1, 10, latest.basis, text_color=color.white)
+        table.cell(panel, 1, 11, latest.status, text_color=color.white)
+
+alertcondition(callSignal, "CALL entry (visual)", "SPY structure CALL entry confirmed. Inspect the frozen entry/SL/TP frame.")
+alertcondition(putSignal, "PUT entry (visual)", "SPY structure PUT entry confirmed. Inspect the frozen entry/SL/TP frame.")
+alertcondition(stopExit, "Structure stop touched (modeled)", "SPY underlying stop touched; not a broker fill confirmation.")
+alertcondition(targetExit, "Structure final TP touched (modeled)", "SPY underlying final target touched; not a broker fill confirmation.")
