@@ -1,0 +1,328 @@
+//@version=6
+strategy("SPY Scalp Lab v30 | Two-Day Backtest + Risk Frames", overlay=true, pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false, calc_on_order_fills=false, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.01, slippage=1, max_boxes_count=100, max_labels_count=200, max_lines_count=200)
+// SEPARATE Strategy Tester script. Existing chart indicators are untouched.
+// Strategy Tester trades UNDERLYING SHARES, not CALL/PUT option premiums.
+// No Webull order webhook is emitted. CALL/PUT are directional references.
+
+groupTest = "0 — Built-in backtest window"
+testMode = input.string("Latest calendar days", "Test range", options=["Latest calendar days", "Custom dates"], group=groupTest)
+testDays = input.int(2, "Latest chart calendar dates included", minval=1, maxval=30, group=groupTest)
+customFrom = input.time(timestamp("01 Jan 2026 00:00 -0500"), "Custom test starts", group=groupTest)
+customUntil = input.time(timestamp("31 Dec 2026 23:59 -0500"), "Custom test ends", group=groupTest)
+showTestShade = input.bool(true, "Shade bars inside the test window", group=groupTest)
+enableSignalAlerts = input.bool(false, "Enable plain-text signal notifications (no broker JSON)", group=groupTest)
+
+groupEntry = "1 — Entry engine"
+entryMode = input.string("Both", "Entry pattern", options=["EMA Cross", "Trend Pullback", "Both"], group=groupEntry)
+fastLen = input.int(10, "Fast EMA", minval=2, group=groupEntry)
+slowLen = input.int(20, "Slow EMA", minval=3, group=groupEntry)
+reverseOnCross = input.bool(true, "Allow an opposite confirmed cross to reverse", group=groupEntry)
+entrySession = input.session("0930-1600", "Entry window — New York", group=groupEntry)
+flatHour = input.int(15, "Force-flat hour — New York", minval=0, maxval=23, group=groupEntry)
+flatMinute = input.int(55, "Force-flat minute", minval=0, maxval=59, group=groupEntry)
+maxTrades = input.int(6, "Maximum entries per New York day", minval=1, maxval=100, group=groupEntry)
+shareUnits = input.int(100, "Strategy Tester SHARES (even number)", minval=2, maxval=1000, step=2, group=groupEntry)
+referenceContracts = input.int(5, "Option contracts — reference display only", minval=1, maxval=20, group=groupEntry)
+
+groupTech = "2 — Optional technical confirmation"
+useTechnicalGate = input.bool(true, "Require technical confluence for entries", tooltip="Off: EMA crosses generate entries without these additional filters. On: rejected crosses remain marked with a reason.", group=groupTech)
+useVWAP = input.bool(true, "Require VWAP alignment", group=groupTech)
+useHTF = input.bool(false, "Require previous completed 15m trend", group=groupTech)
+adxMin = input.float(18, "Minimum ADX", minval=0, maxval=60, step=0.5, group=groupTech)
+volMult = input.float(0.8, "Minimum relative volume", minval=0, step=0.1, group=groupTech)
+rsiUpper = input.float(75, "Maximum long RSI", minval=51, maxval=95, group=groupTech)
+rsiLower = input.float(25, "Minimum short RSI", minval=5, maxval=49, group=groupTech)
+
+groupMacro = "3 — Macro/fundamental context (manual, dated)"
+useMacroGate = input.bool(false, "Apply dated manual macro bias", tooltip="No automatic news or fundamentals feed. Set a bias from your own reviewed information and its validity interval. Historical results with this gate are discretionary, not point-in-time fundamental backtests.", group=groupMacro)
+macroBias = input.string("Neutral", "Reviewed macro bias", options=["Neutral", "Bullish", "Bearish", "No trade"], group=groupMacro)
+macroFrom = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Bias valid from", group=groupMacro)
+macroUntil = input.time(timestamp("02 Jan 2026 00:00 +0000"), "Bias valid until", group=groupMacro)
+useEventGate = input.bool(false, "Exclude manually entered economic-event interval", group=groupMacro)
+eventFrom = input.time(timestamp("01 Jan 2026 13:20 +0000"), "Event blackout starts", group=groupMacro)
+eventUntil = input.time(timestamp("01 Jan 2026 14:00 +0000"), "Event blackout ends", group=groupMacro)
+
+groupRisk = "4 — Frozen SPY / QQQ price levels"
+atrMult = input.float(1.2, "Minimum stop distance (ATR)", minval=0.2, step=0.1, group=groupRisk)
+swingBars = input.int(3, "Swing-stop lookback", minval=2, maxval=20, group=groupRisk)
+stopBufferATR = input.float(0.1, "Buffer beyond swing (ATR)", minval=0, step=0.05, group=groupRisk)
+rr1 = input.float(1, "TP1 reward / risk", minval=0.25, step=0.25, group=groupRisk)
+rr2 = input.float(2, "TP2 reward / risk", minval=0.5, step=0.25, group=groupRisk)
+
+groupDraw = "5 — Boxes and exact-price labels"
+frameBars = input.int(12, "Frame width (bars)", minval=4, maxval=100, group=groupDraw)
+keepFrames = input.int(16, "Completed/current frames retained", minval=1, maxval=20, group=groupDraw)
+showCrosses = input.bool(true, "Mark all closed-bar EMA crosses", group=groupDraw)
+showRejected = input.bool(false, "Label blocked entry reasons", group=groupDraw)
+
+if fastLen >= slowLen or rr2 <= rr1 or shareUnits % 2 != 0
+    runtime.error("Use fast EMA < slow EMA, TP2 R > TP1 R, and an even share quantity.")
+if not timeframe.isminutes or timeframe.multiplier > 5 or (syminfo.ticker != "SPY" and syminfo.ticker != "QQQ")
+    runtime.error("Use standard SPY or QQQ 1–5 minute candles, preferably 5 minutes.")
+if useMacroGate and macroUntil <= macroFrom
+    runtime.error("Macro validity end must be after its start.")
+if useEventGate and eventUntil <= eventFrom
+    runtime.error("Event blackout end must be after its start.")
+
+string TZ = "America/New_York"
+// Anchor to the latest loaded CHART day, not wall-clock time. Indicators warm
+// up on earlier bars; only orders within the selected range are permitted.
+int recentFrom = timestamp(TZ, year(last_bar_time, TZ), month(last_bar_time, TZ), dayofmonth(last_bar_time, TZ) - testDays + 1, 0, 0)
+int recentUntil = last_bar_time + int(timeframe.in_seconds() * 1000)
+int testFrom = testMode == "Latest calendar days" ? recentFrom : customFrom
+int testUntil = testMode == "Latest calendar days" ? recentUntil : customUntil
+if testUntil <= testFrom
+    runtime.error("Backtest end must follow its start.")
+bool inTest = time >= testFrom and time_close <= testUntil
+var array<int> testedDates = array.new<int>()
+int localDate = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+if barstate.isconfirmed and inTest and not na(time(timeframe.period, entrySession, TZ)) and not array.includes(testedDates, localDate)
+    array.push(testedDates, localDate)
+newDay = ta.change(time("D", "0000-2359:1234567", TZ)) != 0
+var int dayTrades = 0
+if newDay
+    dayTrades := 0
+inEntry = not na(time(timeframe.period, entrySession, TZ))
+cutoff = hour(time_close, TZ) * 60 + minute(time_close, TZ) >= flatHour * 60 + flatMinute
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+vwapLine = ta.vwap(hlc3)
+[plusDI, minusDI, adxValue] = ta.dmi(14, 14)
+rsiValue = ta.rsi(close, 14)
+atrValue = ta.atr(14)
+volumeAverage = ta.sma(volume, 20)
+rvol = volumeAverage > 0 ? volume / volumeAverage : na
+swingLow = ta.lowest(low, swingBars)
+swingHigh = ta.highest(high, swingBars)
+[htfClose, htfEMA] = request.security(syminfo.tickerid, "15", [close[1], ta.ema(close, 20)[1]], lookahead=barmerge.lookahead_on)
+htfBull = not na(htfClose) and htfClose > htfEMA
+htfBear = not na(htfClose) and htfClose < htfEMA
+crossUp = ta.crossover(emaFast, emaSlow)
+crossDown = ta.crossunder(emaFast, emaSlow)
+pullbackUp = emaFast > emaSlow and low[1] <= emaFast[1] and close[1] <= emaFast[1] and close > emaFast and close > open
+pullbackDown = emaFast < emaSlow and high[1] >= emaFast[1] and close[1] >= emaFast[1] and close < emaFast and close < open
+longPattern = entryMode == "EMA Cross" ? crossUp : entryMode == "Trend Pullback" ? pullbackUp : crossUp or pullbackUp
+shortPattern = entryMode == "EMA Cross" ? crossDown : entryMode == "Trend Pullback" ? pullbackDown : crossDown or pullbackDown
+techLong = close > emaSlow and plusDI > minusDI and adxValue >= adxMin and rvol >= volMult and rsiValue > 50 and rsiValue < rsiUpper and (not useVWAP or close > vwapLine) and (not useHTF or htfBull)
+techShort = close < emaSlow and minusDI > plusDI and adxValue >= adxMin and rvol >= volMult and rsiValue < 50 and rsiValue > rsiLower and (not useVWAP or close < vwapLine) and (not useHTF or htfBear)
+macroValid = time_close >= macroFrom and time_close <= macroUntil
+macroLong = not useMacroGate or (macroValid and (macroBias == "Neutral" or macroBias == "Bullish"))
+macroShort = not useMacroGate or (macroValid and (macroBias == "Neutral" or macroBias == "Bearish"))
+eventBlocked = useEventGate and time < eventUntil and time_close > eventFrom
+
+f_price(float p) =>
+    str.tostring(p, format.mintick)
+
+type TradeFrame
+    int side
+    int startBar
+    int closedAtEntry
+    float entry
+    float stop
+    float tp1
+    float tp2
+    bool firstExitDone
+    box reward
+    box risk
+    line entryLine
+    line stopLine
+    line tp1Line
+    line tp2Line
+    label entryLabel
+    label stopLabel
+    label tp1Label
+    label tp2Label
+    string status
+
+var array<TradeFrame> history = array.new<TradeFrame>()
+var TradeFrame active = na
+var string lastReason = "WAIT CONFIRMED PATTERN"
+var int observedClosed = 0
+var array<label> rejectedLabels = array.new<label>()
+bool longSignal = false
+bool shortSignal = false
+
+// Mark actual strategy exits, not high/low guesses about execution order.
+if barstate.isconfirmed and strategy.closedtrades > observedClosed
+    for i = observedClosed to strategy.closedtrades - 1
+        if not na(active) and strategy.closedtrades.entry_bar_index(i) >= active.startBar
+            if strategy.closedtrades.exit_id(i) == "TP1 / SL"
+                active.firstExitDone := true
+    observedClosed := strategy.closedtrades
+
+if barstate.isconfirmed and not na(active)
+    bool closed = bar_index > active.startBar and strategy.position_size == 0 and strategy.closedtrades > active.closedAtEntry
+    if closed
+        active.status := "CLOSED (TESTER)"
+        int finish = math.max(active.startBar + 3, bar_index)
+        int middle = int(math.avg(active.startBar, finish))
+        box.set_right(active.reward, finish)
+        box.set_right(active.risk, finish)
+        line.set_x2(active.entryLine, finish)
+        line.set_x2(active.stopLine, finish)
+        line.set_x2(active.tp1Line, finish)
+        line.set_x2(active.tp2Line, finish)
+        label.set_x(active.entryLabel, middle)
+        label.set_x(active.stopLabel, middle)
+        label.set_x(active.tp1Label, finish)
+        label.set_x(active.tp2Label, middle)
+        label.set_text(active.entryLabel, (active.side == 1 ? "CALL" : "PUT") + " SIGNAL ENTRY " + f_price(active.entry) + "\nCLOSED — UNDERLYING TEST")
+        label.set_color(active.entryLabel, color.gray)
+        active := na
+
+if barstate.isconfirmed
+    if (cutoff or not inTest) and strategy.position_size != 0
+        strategy.close_all(comment=not inTest ? "TEST WINDOW END" : "TIME CUTOFF", immediately=true, disable_alert=true)
+    if longPattern or shortPattern
+        int side = longPattern ? 1 : -1
+        bool positionOK = na(active) or (reverseOnCross and active.side != side and (side == 1 ? crossUp : crossDown))
+        bool technicalOK = not useTechnicalGate or (side == 1 ? techLong : techShort)
+        bool macroOK = side == 1 ? macroLong : macroShort
+        string techReason = adxValue < adxMin ? "ADX BELOW THRESHOLD" : na(rvol) or rvol < volMult ? "RELATIVE VOLUME LOW / MISSING" : useVWAP and (side == 1 ? close <= vwapLine : close >= vwapLine) ? "VWAP NOT ALIGNED" : useHTF and (side == 1 ? not htfBull : not htfBear) ? "CLOSED 15m NOT ALIGNED" : "RSI / DMI / TREND NOT ALIGNED"
+        bool sizeOK = shareUnits * close <= strategy.equity * 0.95
+        bool ready = not na(atrValue) and not na(swingLow) and not na(swingHigh)
+        lastReason := not inTest ? "OUTSIDE TEST WINDOW" : not sizeOK ? "INSUFFICIENT MODEL EQUITY" : not ready ? "ATR / SWING WARMUP" : not inEntry ? "OUTSIDE ENTRY WINDOW" : cutoff ? "TIME CUTOFF" : eventBlocked ? "MANUAL EVENT BLACKOUT" : not macroOK ? (not macroValid ? "MACRO BIAS EXPIRED / MISSING" : "MANUAL MACRO BIAS") : not positionOK ? "ALREADY TRACKING SAME SIDE" : dayTrades >= maxTrades ? "DAILY ENTRY LIMIT" : not technicalOK ? techReason : "ENTRY ACCEPTED"
+        if lastReason == "ENTRY ACCEPTED"
+            // Opposite entries reverse the underlying Tester position; old drawings freeze.
+            if not na(active)
+                active.status := "OPPOSITE CROSS"
+                label.set_text(active.entryLabel, (active.side == 1 ? "CALL" : "PUT") + " SIGNAL ENTRY " + f_price(active.entry) + "\nOPPOSITE CROSS")
+                strategy.cancel("TP1 / SL")
+                strategy.cancel("TP2 / SL")
+            float entry = math.round_to_mintick(close)
+            float stop = math.round_to_mintick(side == 1 ? math.min(swingLow - atrValue * stopBufferATR, entry - atrValue * atrMult) : math.max(swingHigh + atrValue * stopBufferATR, entry + atrValue * atrMult))
+            float riskDistance = math.abs(entry - stop)
+            float tp1 = math.round_to_mintick(entry + side * riskDistance * rr1)
+            float tp2 = math.round_to_mintick(entry + side * riskDistance * rr2)
+            int right = bar_index + frameBars
+            string direction = side == 1 ? "CALL" : "PUT"
+            string reference = "ATM REF " + str.tostring(math.round(entry), "#") + (side == 1 ? "C" : "P") + " x " + str.tostring(referenceContracts)
+            reward = box.new(bar_index, math.max(entry, tp2), right, math.min(entry, tp2), border_color=color.teal, border_width=2, bgcolor=color.new(color.teal, 80), text="", text_color=color.teal)
+            danger = box.new(bar_index, math.max(entry, stop), right, math.min(entry, stop), border_color=color.red, border_width=2, bgcolor=color.new(color.red, 82), text="", text_color=color.red)
+            el = line.new(bar_index, entry, right, entry, color=color.blue, width=3)
+            sl = line.new(bar_index, stop, right, stop, color=color.red, width=2)
+            t1 = line.new(bar_index, tp1, right, tp1, color=color.teal, style=line.style_dashed)
+            t2 = line.new(bar_index, tp2, right, tp2, color=color.teal, width=2)
+            int middle = int(math.avg(bar_index, right))
+            le = label.new(middle, entry, direction + " SIGNAL ENTRY " + f_price(entry) + "\nRisk/reward: " + str.tostring(rr2, "#.##") + " | UNDERLYING TEST", style=label.style_label_center, color=color.teal, textcolor=color.white, size=size.normal)
+            ls = label.new(middle, stop, "Stop " + f_price(stop) + " | " + f_price(riskDistance) + " pts", style=side == 1 ? label.style_label_up : label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+            l1 = label.new(right, tp1, "TP1 " + f_price(tp1), style=label.style_label_left, color=color.teal, textcolor=color.white)
+            l2 = label.new(middle, tp2, "Target " + f_price(tp2) + " | " + f_price(math.abs(tp2 - entry)) + " pts", style=side == 1 ? label.style_label_down : label.style_label_up, color=color.teal, textcolor=color.white)
+            active := TradeFrame.new(side, bar_index, strategy.closedtrades, entry, stop, tp1, tp2, false, reward, danger, el, sl, t1, t2, le, ls, l1, l2, "OPEN")
+            array.push(history, active)
+            dayTrades += 1
+            longSignal := side == 1
+            shortSignal := side == -1
+            strategy.entry(side == 1 ? "CALL" : "PUT", side == 1 ? strategy.long : strategy.short, qty=shareUnits, disable_alert=true)
+        else if showRejected
+            rejection = label.new(bar_index, side == 1 ? low : high, "NO ENTRY\n" + lastReason, style=side == 1 ? label.style_label_up : label.style_label_down, color=color.gray, textcolor=color.white, size=size.tiny)
+            array.push(rejectedLabels, rejection)
+            while array.size(rejectedLabels) > 30
+                label.delete(array.shift(rejectedLabels))
+
+// Submit both protective brackets on the SAME evaluation as the entry.
+// Fixed quantities prevent repeated 50%-of-remaining exit resizing.
+if not na(active)
+    string entryId = active.side == 1 ? "CALL" : "PUT"
+    if not active.firstExitDone
+        strategy.exit("TP1 / SL", from_entry=entryId, stop=active.stop, limit=active.tp1, qty=shareUnits / 2, disable_alert=true)
+    strategy.exit("TP2 / SL", from_entry=entryId, stop=active.stop, limit=active.tp2, qty=shareUnits / 2, disable_alert=true)
+    int right = bar_index + frameBars
+    box.set_right(active.reward, right)
+    box.set_right(active.risk, right)
+    line.set_x2(active.entryLine, right)
+    line.set_x2(active.stopLine, right)
+    line.set_x2(active.tp1Line, right)
+    line.set_x2(active.tp2Line, right)
+    int middle = int(math.avg(active.startBar, right))
+    label.set_x(active.entryLabel, middle)
+    label.set_x(active.stopLabel, middle)
+    label.set_x(active.tp1Label, right)
+    label.set_x(active.tp2Label, middle)
+
+while array.size(history) > keepFrames
+    old = array.shift(history)
+    box.delete(old.reward)
+    box.delete(old.risk)
+    line.delete(old.entryLine)
+    line.delete(old.stopLine)
+    line.delete(old.tp1Line)
+    line.delete(old.tp2Line)
+    label.delete(old.entryLabel)
+    label.delete(old.stopLabel)
+    label.delete(old.tp1Label)
+    label.delete(old.tp2Label)
+
+plot(emaFast, "Fast EMA", color=color.aqua, linewidth=2)
+plot(emaSlow, "Slow EMA", color=color.orange, linewidth=2)
+plot(vwapLine, "Session VWAP", color=color.purple)
+plotshape(showCrosses and barstate.isconfirmed and crossUp, "Raw bullish cross — not a fill", shape.triangleup, location.belowbar, color.aqua, size=size.tiny)
+plotshape(showCrosses and barstate.isconfirmed and crossDown, "Raw bearish cross — not a fill", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+plotshape(longSignal, "Accepted CALL entry", shape.labelup, location.belowbar, color.teal, text="CALL", textcolor=color.white, size=size.small)
+plotshape(shortSignal, "Accepted PUT entry", shape.labeldown, location.abovebar, color.red, text="PUT", textcolor=color.white, size=size.small)
+
+var table dash = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 10), border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "SCALP LAB v30", text_color=color.white)
+    table.cell(dash, 1, 0, entryMode, text_color=color.aqua)
+    table.cell(dash, 0, 1, "LAST DECISION", text_color=color.white)
+    table.cell(dash, 1, 1, lastReason, text_color=color.white)
+    table.cell(dash, 0, 2, "ADX / RVOL / RSI", text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(adxValue, "#.0") + " / " + str.tostring(rvol, "#.00") + " / " + str.tostring(rsiValue, "#.0"), text_color=color.white)
+    table.cell(dash, 0, 3, "VWAP / CLOSED 15m", text_color=color.white)
+    table.cell(dash, 1, 3, (close > vwapLine ? "ABOVE" : "BELOW") + " / " + (htfBull ? "BULL" : htfBear ? "BEAR" : "N/A"), text_color=color.white)
+    table.cell(dash, 0, 4, "MANUAL MACRO", text_color=color.white)
+    table.cell(dash, 1, 4, not useMacroGate ? "OFF — NO LIVE FEED" : macroValid ? macroBias : "EXPIRED / MISSING", text_color=color.orange)
+    table.cell(dash, 0, 5, "EVENT BLACKOUT", text_color=color.white)
+    table.cell(dash, 1, 5, eventBlocked ? "BLOCKED" : useEventGate ? "OUTSIDE MANUAL INTERVAL" : "OFF — NO CALENDAR FEED", text_color=color.orange)
+    table.cell(dash, 0, 6, "LATEST SIGNAL ENTRY", text_color=color.white)
+    table.cell(dash, 0, 7, "STOP LOSS", text_color=color.white)
+    table.cell(dash, 0, 8, "TP1 / TP2", text_color=color.white)
+    table.cell(dash, 0, 9, "FRAME STATUS", text_color=color.white)
+    table.cell(dash, 0, 10, "ENTRIES TODAY", text_color=color.white)
+    table.cell(dash, 1, 10, str.tostring(dayTrades), text_color=color.white)
+    table.cell(dash, 0, 11, "TESTER MODEL", text_color=color.white)
+    table.cell(dash, 1, 11, "UNDERLYING SHARES + COSTS", text_color=color.orange)
+    table.cell(dash, 0, 12, "AVG TESTER FILL", text_color=color.white)
+    table.cell(dash, 1, 12, strategy.position_size != 0 ? f_price(strategy.position_avg_price) : "FLAT", text_color=color.white)
+    table.cell(dash, 0, 13, "WEBULL AUTOMATION", text_color=color.white)
+    table.cell(dash, 1, 13, "NOT CONNECTED BY THIS SCRIPT", text_color=color.orange)
+    if array.size(history) > 0
+        latest = array.get(history, array.size(history) - 1)
+        table.cell(dash, 1, 6, (latest.side == 1 ? "CALL " : "PUT ") + f_price(latest.entry), text_color=color.aqua)
+        table.cell(dash, 1, 7, f_price(latest.stop), text_color=color.red)
+        table.cell(dash, 1, 8, f_price(latest.tp1) + " / " + f_price(latest.tp2), text_color=color.lime)
+        table.cell(dash, 1, 9, latest.status + (latest.firstExitDone ? " | FIRST TRANCHE EXITED" : ""), text_color=color.white)
+
+// Strategies use alert() or order-fill alerts; alertcondition() does not create
+// usable strategy alerts. Plain text below is not a broker-order JSON payload.
+if enableSignalAlerts and (longSignal or shortSignal)
+    alert((longSignal ? "CALL" : "PUT") + " SIGNAL | " + syminfo.ticker + " | Entry " + f_price(active.entry) + " | SL " + f_price(active.stop) + " | TP1 " + f_price(active.tp1) + " | TP2 " + f_price(active.tp2), alert.freq_once_per_bar_close)
+
+// These figures come from TradingView's broker emulator, not decorative scores.
+// Each 50% bracket can create a closed-exit record, so these are not round trips.
+var table results = table.new(position.bottom_right, 2, 10, bgcolor=color.new(color.black, 8), border_width=1)
+if barstate.islast
+    float factor = strategy.grossloss < 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    float winPercent = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+    table.cell(results, 0, 0, "BACKTEST — UNDERLYING", text_color=color.white)
+    table.cell(results, 1, 0, "NOT OPTION FILLS", text_color=color.orange)
+    table.cell(results, 0, 1, "DATES (NEW YORK)", text_color=color.white)
+    table.cell(results, 1, 1, str.format_time(testFrom, "yyyy-MM-dd", TZ) + " to " + str.format_time(testUntil, "yyyy-MM-dd", TZ), text_color=color.white)
+    table.cell(results, 0, 2, "ACTUAL SESSIONS LOADED", text_color=color.white)
+    table.cell(results, 1, 2, str.tostring(array.size(testedDates)), text_color=color.white)
+    table.cell(results, 0, 3, "CLOSED EXIT RECORDS", text_color=color.white)
+    table.cell(results, 1, 3, str.tostring(strategy.closedtrades), text_color=color.white)
+    table.cell(results, 0, 4, "WIN % (EXIT RECORDS)", text_color=color.white)
+    table.cell(results, 1, 4, strategy.closedtrades > 0 ? str.tostring(winPercent, "#.0") + "%" : "NO CLOSED EXITS", text_color=color.white)
+    table.cell(results, 0, 5, "NET P/L — TESTER USD", text_color=color.white)
+    table.cell(results, 1, 5, str.tostring(strategy.netprofit, "#.00"), text_color=strategy.netprofit >= 0 ? color.lime : color.red)
+    table.cell(results, 0, 6, "PROFIT FACTOR", text_color=color.white)
+    table.cell(results, 1, 6, na(factor) ? "N/A — NO REALIZED LOSSES" : str.tostring(factor, "#.00"), text_color=color.white)
+    table.cell(results, 0, 7, "MAX DRAWDOWN — USD", text_color=color.white)
+    table.cell(results, 1, 7, str.tostring(strategy.max_drawdown, "#.00"), text_color=color.white)
+    table.cell(results, 0, 8, "OPEN POSITION P/L", text_color=color.white)
+    table.cell(results, 1, 8, str.tostring(strategy.openprofit, "#.00"), text_color=color.white)
+    table.cell(results, 0, 9, "DEFAULT COSTS", text_color=color.white)
+    table.cell(results, 1, 9, "0.01% COMMISSION / 1 TICK", text_color=color.white)
+bgcolor(showTestShade and inTest ? color.new(color.blue, 96) : na, title="Selected backtest range")
